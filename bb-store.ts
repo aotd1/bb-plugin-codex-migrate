@@ -4,6 +4,7 @@ import { join, sep } from "node:path";
 import Database from "better-sqlite3";
 import type { History, ImportEvent } from "./history.js";
 import { newId } from "./history.js";
+import { formatTitle, type TitleMode } from "./titles.js";
 import type { SourceThread } from "./source.js";
 
 interface IdentityRow {
@@ -82,6 +83,8 @@ export class BbStore {
     projectRoot: string;
     source: SourceThread;
     history: History;
+    titleMode?: TitleMode;
+    titleMaxLength?: number;
   }): string {
     if (this.existing(args.source.id)) throw new Error(`Codex thread ${args.source.id} is already imported`);
     const threadId = newId("thr");
@@ -113,7 +116,7 @@ export class BbStore {
           last_read_at,latest_attention_at,created_at,updated_at,visibility)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
       `).run(threadId, args.projectId, environmentId, "codex", "idle",
-        args.source.title.trim() || null,
+        formatTitle(args.source.title, args.titleMode ?? "truncate", args.titleMaxLength ?? 80) || null,
         args.source.archived ? (args.source.archivedAt ?? args.source.updatedAtMs) : null,
         args.source.updatedAtMs, args.source.updatedAtMs,
         args.source.createdAtMs, args.source.updatedAtMs, "visible");
@@ -151,6 +154,31 @@ export class BbStore {
     });
     write.immediate();
     return threadId;
+  }
+
+  repairImportedThread(source: SourceThread, titleMode: TitleMode, titleMaxLength: number): { events: number; title: boolean } {
+    const existing = this.existing(source.id);
+    if (!existing) return { events: 0, title: false };
+    const rows = this.db.prepare("SELECT id,data FROM events WHERE thread_id=? AND type='item/completed' AND item_kind='toolCall'")
+      .all(existing.threadId) as { id: string; data: string }[];
+    const fixes = rows.flatMap((row) => {
+      const data = JSON.parse(row.data) as { item?: { error?: unknown } };
+      if (!data.item || !Object.hasOwn(data.item, "error") || data.item.error !== null) return [];
+      delete data.item.error;
+      return [{ id: row.id, data: JSON.stringify(data) }];
+    });
+    const originalTitle = source.title.trim();
+    const nextTitle = formatTitle(source.title, titleMode, titleMaxLength);
+    const current = this.db.prepare("SELECT title FROM threads WHERE id=?").get(existing.threadId) as { title: string | null };
+    const managedTitle = current.title === originalTitle || Array.from({ length: 171 }, (_, index) => index + 30)
+      .some((length) => current.title === formatTitle(originalTitle, "truncate", length));
+    const retitle = Boolean(originalTitle && managedTitle && current.title !== nextTitle);
+    if (fixes.length || retitle) this.db.transaction(() => {
+      const updateEvent = this.db.prepare("UPDATE events SET data=? WHERE id=?");
+      for (const fix of fixes) updateEvent.run(fix.data, fix.id);
+      if (retitle) this.db.prepare("UPDATE threads SET title=? WHERE id=?").run(nextTitle, existing.threadId);
+    }).immediate();
+    return { events: fixes.length, title: retitle };
   }
 }
 

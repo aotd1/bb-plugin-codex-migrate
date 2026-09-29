@@ -14,6 +14,8 @@ function CodexMigrationPage() {
   const [busy, setBusy] = useState(false);
   const [starting, setStarting] = useState(false);
   const [current, setCurrent] = useState<RunStatus | null>(null);
+  const [repairing, setRepairing] = useState(false);
+  const [repairResult, setRepairResult] = useState<string | null>(null);
 
   const refreshStatus = useCallback(async () => {
     const status = await rpc.call("status", null);
@@ -46,6 +48,7 @@ function CodexMigrationPage() {
   const toggleAll = (checked: boolean) => {
     setSelectedRoots(checked ? allRoots : []);
     setPreview(null);
+    setRepairResult(null);
   };
 
   const toggleProject = (project: ProjectSummary) => {
@@ -74,6 +77,26 @@ function CodexMigrationPage() {
     }
   };
 
+  const repairSelected = async () => {
+    if (selectedRoots.length === 0) return;
+    setRepairing(true);
+    setError(null);
+    setRepairResult(null);
+    try {
+      const bbProjectIds = [...new Set(projects?.flatMap((project) => project.rootDetails)
+        .filter((root) => selectedRoots.includes(root.key) && root.targetProjectId)
+        .map((root) => root.targetProjectId!) ?? [])];
+      const result = await rpc.call("repair", bbProjectIds.length
+        ? { projects: [], bbProjectIds, all: false }
+        : { projects: [], roots: selectedRoots, all: false });
+      setRepairResult(`${result.threads} existing chats checked · ${result.events} events repaired · ${result.titles} titles shortened`);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRepairing(false);
+    }
+  };
+
   const uniqueRoots = [...new Map(preview?.flatMap((project) => project.rootDetails.map((root) => [root.key, root])) ?? []).values()];
   const unresolvedConflicts = [...new Map(preview?.flatMap((project) => project.conflicts.map((conflict) => [conflict.sourceId, conflict])) ?? []).values()];
   const eligibleRoots = uniqueRoots.filter((root) => root.kind !== "missing" && (root.kind !== "non-git" || gitInitRoots.includes(root.key)));
@@ -96,6 +119,7 @@ function CodexMigrationPage() {
       <div className="mx-auto box-border w-full max-w-3xl px-4 pb-8 pt-4 md:px-5">
         <h1 className="text-xl font-semibold">Import from Codex</h1>
         <p className="mt-2 text-sm text-muted-foreground">Select folders to import. Shared folders stay selected together in every Codex project.</p>
+        <p className="mt-1 text-xs text-muted-foreground">Imported chat titles are shortened to 80 characters by default. Change the mode or length in Settings → Installed plugins → Codex Migrate.</p>
         {error && <p role="alert" className="mt-3 text-sm text-destructive">{error}</p>}
         {projects === null ? <p className="mt-6 text-sm text-muted-foreground">Scanning Codex projects…</p> : (
           <div className="mt-5 divide-y divide-border rounded-lg border border-border bg-card">
@@ -148,6 +172,12 @@ function CodexMigrationPage() {
         <Button className="mt-4" onClick={inspect} disabled={selectedRoots.length === 0 || busy}>
           {busy ? "Scanning…" : "Preview selected projects"}
         </Button>
+        <div className="mt-3">
+          <Button variant="outline" onClick={repairSelected} disabled={selectedRoots.length === 0 || repairing || current?.state === "running"}>
+            {repairing ? "Repairing…" : "Repair existing chats in selected folders"}
+          </Button>
+          {repairResult && <p className="mt-2 text-sm text-muted-foreground" role="status">{repairResult}. Reopen a repaired chat to reload its timeline.</p>}
+        </div>
         {preview && <div className="mt-6 space-y-4">
           {uniqueRoots.map((root) => <section key={root.key} className="rounded-lg border border-border bg-card p-4">
             <h2 className="break-all font-medium">{root.path}</h2>

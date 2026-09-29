@@ -70,3 +70,25 @@ test("chat environment follows its own directory in a multi-root Codex project",
     assert.equal(environment.path, second);
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("repair removes invalid null errors and shortens only untouched imported titles", () => {
+  const { directory, source, history } = fixture(true);
+  source.title = "A long Codex chat title that should become a short BB title after repair";
+  history.events.push({ id: "evt_3", sequence: 3, scopeKind: "turn", turnId: "turn_1", providerThreadId: "codex_thread",
+    type: "item/completed", itemId: "tool_1", itemKind: "toolCall", data: JSON.stringify({ item: { type: "toolCall", id: "tool_1", error: null } }), createdAt: 120 });
+  const store = new BbStore(directory, true);
+  try {
+    const threadId = store.importThread({ projectId: "proj_test", hostId: "host_test", projectRoot: directory, source, history, titleMode: "original" });
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 40), { events: 1, title: true });
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 40), { events: 0, title: false });
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 50), { events: 0, title: true });
+    assert.deepEqual(store.repairImportedThread(source, "original", 50), { events: 0, title: true });
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 40), { events: 0, title: true });
+    const event = store.db.prepare("SELECT data FROM events WHERE id='evt_3'").get();
+    assert.equal(Object.hasOwn(JSON.parse(event.data).item, "error"), false);
+    const title = store.db.prepare("SELECT title FROM threads WHERE id=?").get(threadId).title;
+    assert.ok(title.length <= 40);
+    const segment = store.db.prepare("SELECT text FROM thread_search_segments WHERE thread_id=? AND source_kind='title'").get(threadId);
+    assert.equal(segment.text, source.title);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});

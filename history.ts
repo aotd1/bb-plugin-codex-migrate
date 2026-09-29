@@ -99,7 +99,7 @@ function normalizeItem(item: Record<string, unknown>): Record<string, unknown> {
   if (kind === "mcpToolCall") return {
     type: "toolCall", id, server: string(item.server, "mcp"), tool: string(item.tool, "unknown"),
     arguments: object(item.arguments), status: status(item.status), result: item.result ?? null,
-    error: item.error == null ? null : string(item.error, JSON.stringify(item.error)),
+    ...(item.error == null ? {} : { error: string(item.error, JSON.stringify(item.error)) }),
     durationMs: typeof item.durationMs === "number" ? item.durationMs : null,
   };
   if (kind === "functionCallOutput") return {

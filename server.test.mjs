@@ -57,6 +57,9 @@ test("explicit project selection creates a new BB project; omission imports noth
     assert.equal(missing.exitCode, 1);
     assert.match(missing.stderr, /Select a project/);
     assert.equal(created.length, 0);
+    const unselectedRepair = await harness.behavior.runCli(["repair", "--json"]);
+    assert.equal(unselectedRepair.exitCode, 1);
+    assert.match(unselectedRepair.stderr, /Select a project or folder explicitly/);
     const skipped = await harness.behavior.runCli(["apply", "--project", "Fixture Project", "--json"]);
     assert.equal(skipped.exitCode, 1);
     assert.match(skipped.stderr, /No importable folders/);

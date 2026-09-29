@@ -1,13 +1,13 @@
 {
   "name": "bb-plugin-codex-migrate",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "repository": {
     "type": "git",
     "url": "https://github.com/aotd1/bb-plugin-codex-migrate.git"
   },
   "type": "module",
   "scripts": {
-    "test": "tsc -p tsconfig.test-build.json && node --test bb-store.test.mjs routing.test.mjs server.test.mjs source.test.mjs"
+    "test": "tsc -p tsconfig.test-build.json && node --test bb-store.test.mjs history.test.mjs routing.test.mjs server.test.mjs source.test.mjs"
   },
   "engines": {
     "bb": ">=0.44 <0.45",
