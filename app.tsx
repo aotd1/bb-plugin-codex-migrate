@@ -14,8 +14,6 @@ function CodexMigrationPage() {
   const [busy, setBusy] = useState(false);
   const [starting, setStarting] = useState(false);
   const [current, setCurrent] = useState<RunStatus | null>(null);
-  const [repairing, setRepairing] = useState(false);
-  const [repairResult, setRepairResult] = useState<string | null>(null);
 
   const refreshStatus = useCallback(async () => {
     const status = await rpc.call("status", null);
@@ -48,7 +46,6 @@ function CodexMigrationPage() {
   const toggleAll = (checked: boolean) => {
     setSelectedRoots(checked ? allRoots : []);
     setPreview(null);
-    setRepairResult(null);
   };
 
   const toggleProject = (project: ProjectSummary) => {
@@ -74,26 +71,6 @@ function CodexMigrationPage() {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
-    }
-  };
-
-  const repairSelected = async () => {
-    if (selectedRoots.length === 0) return;
-    setRepairing(true);
-    setError(null);
-    setRepairResult(null);
-    try {
-      const bbProjectIds = [...new Set(projects?.flatMap((project) => project.rootDetails)
-        .filter((root) => selectedRoots.includes(root.key) && root.targetProjectId)
-        .map((root) => root.targetProjectId!) ?? [])];
-      const result = await rpc.call("repair", bbProjectIds.length
-        ? { projects: [], bbProjectIds, all: false }
-        : { projects: [], roots: selectedRoots, all: false });
-      setRepairResult(`${result.threads} existing chats checked · ${result.events} events repaired · ${result.titles} titles shortened`);
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setRepairing(false);
     }
   };
 
@@ -172,12 +149,6 @@ function CodexMigrationPage() {
         <Button className="mt-4" onClick={inspect} disabled={selectedRoots.length === 0 || busy}>
           {busy ? "Scanning…" : "Preview selected projects"}
         </Button>
-        <div className="mt-3">
-          <Button variant="outline" onClick={repairSelected} disabled={selectedRoots.length === 0 || repairing || current?.state === "running"}>
-            {repairing ? "Repairing…" : "Repair existing chats in selected folders"}
-          </Button>
-          {repairResult && <p className="mt-2 text-sm text-muted-foreground" role="status">{repairResult}. Reopen a repaired chat to reload its timeline.</p>}
-        </div>
         {preview && <div className="mt-6 space-y-4">
           {uniqueRoots.map((root) => <section key={root.key} className="rounded-lg border border-border bg-card p-4">
             <h2 className="break-all font-medium">{root.path}</h2>

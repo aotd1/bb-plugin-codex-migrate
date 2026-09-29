@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-codex-migrate",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "repository": {
     "type": "git",
     "url": "https://github.com/aotd1/bb-plugin-codex-migrate.git"

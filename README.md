@@ -15,7 +15,7 @@ The bundled BB Codex provider is not required; this plugin reads Codex data dire
 Install the released plugin from GitHub:
 
 ```sh
-bb plugin install git:https://github.com/aotd1/bb-plugin-codex-migrate.git@^0.3.10
+bb plugin install git:https://github.com/aotd1/bb-plugin-codex-migrate.git@^0.3.11
 ```
 
 To build and install a local checkout instead:
@@ -42,7 +42,7 @@ bb codex-migrate repair --bb-project proj_example --json
 
 `scan` without a selector lists projects. CLI `apply` requires `--project`, `--folder`, or an explicit `--all`; it never imports every project by default. Normal `apply` skips IDs already in BB; `--existing-only` verifies their message counts and archive state without adding chats. `--limit N` caps new chats in one run; rerun the same command to continue. Existing Codex source IDs are matched through BB's `thread/identity` events, so reruns do not duplicate them. `status` shows the active run, its last update, and the last completed report. If BB restarts during a run, the status becomes `interrupted`; repeat the same selection to continue.
 
-Imported chat titles are shortened to 80 characters by default. In **Settings → Installed plugins → Codex Migrate**, set **Imported chat titles** to `original` to preserve the full title, or change **Maximum title length** (30–200). Shortening runs locally and does not send chat content to an AI service. The full source title stays in search. Changing the setting affects new imports; use **Repair existing chats in selected folders** in the migration page, or `bb codex-migrate repair --bb-project ID`, to apply it to existing chats. Repair also removes invalid `error: null` fields written by older importer versions, which prevented some timelines from loading. It creates a SQLite backup before changing BB and does not import new chats. The repair command accepts explicit `--project`, `--folder`, `--bb-project`, or `--all` selection. It preserves manually renamed titles.
+Imported chat titles are shortened to 80 characters by default. In **Settings → Installed plugins → Codex Migrate**, set **Imported chat titles** to `original` to preserve the full title, or change **Maximum title length** (30–200). Shortening runs locally and does not send chat content to an AI service. The full source title stays in search. Changing the setting affects new imports; `bb codex-migrate repair --bb-project ID` applies it to existing chats when needed. Repair also removes invalid `error: null` fields written by older importer versions, which prevented some timelines from loading. It creates a SQLite backup before changing BB and does not import new chats. The repair command accepts explicit `--project`, `--folder`, `--bb-project`, or `--all` selection. It preserves manually renamed titles.
 
 ## Projects with several directories
 
