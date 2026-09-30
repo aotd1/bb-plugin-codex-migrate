@@ -92,3 +92,37 @@ test("repair removes invalid null errors and shortens only untouched imported ti
     assert.equal(segment.text, source.title);
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });
+
+test("repair replaces a previously imported first-message title with the Codex name", () => {
+  const { directory, source, history } = fixture(true);
+  const firstMessage = "First user message with a very long title that was imported before names were read";
+  source.title = firstMessage;
+  source.fallbackTitle = firstMessage;
+  const store = new BbStore(directory, true);
+  try {
+    const threadId = store.importThread({ projectId: "proj_test", hostId: "host_test", projectRoot: directory,
+      source, history, titleMaxLength: 40 });
+    source.title = "Proper Codex chat name";
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 40), { events: 0, title: true });
+    assert.equal(store.db.prepare("SELECT title FROM threads WHERE id=?").get(threadId).title, source.title);
+    assert.equal(store.db.prepare("SELECT text FROM thread_search_segments WHERE thread_id=? AND source_kind='title'").get(threadId).text, source.title);
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 40), { events: 0, title: false });
+    store.db.prepare("UPDATE threads SET title=? WHERE id=?").run("My manual BB title", threadId);
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 40), { events: 0, title: false });
+    assert.equal(store.db.prepare("SELECT title FROM threads WHERE id=?").get(threadId).title, "My manual BB title");
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("repair fills an empty imported title when Codex has a chat name", () => {
+  const { directory, source, history } = fixture(true);
+  source.title = "";
+  source.fallbackTitle = "";
+  const store = new BbStore(directory, true);
+  try {
+    const threadId = store.importThread({ projectId: "proj_test", hostId: "host_test", projectRoot: directory, source, history });
+    source.title = "Named in Codex";
+    assert.deepEqual(store.repairImportedThread(source, "truncate", 80), { events: 0, title: true });
+    assert.equal(store.db.prepare("SELECT title FROM threads WHERE id=?").get(threadId).title, source.title);
+    assert.equal(store.db.prepare("SELECT text FROM thread_search_segments WHERE thread_id=? AND source_kind='title'").get(threadId).text, source.title);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});

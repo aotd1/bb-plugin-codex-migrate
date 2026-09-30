@@ -15,6 +15,7 @@ export interface SourceProject {
 export interface SourceThread {
   id: string;
   title: string;
+  fallbackTitle: string;
   cwd: string;
   projectId: string | null;
   archived: boolean;
@@ -36,6 +37,7 @@ interface ThreadRow {
   id: string;
   project_id: string | null;
   title: string;
+  name?: string | null;
   cwd: string;
   archived: number;
   archived_at: number | null;
@@ -136,7 +138,8 @@ export class CodexCatalog {
       .sort((a, b) => (a.created_at_ms ?? a.created_at * 1000) - (b.created_at_ms ?? b.created_at * 1000))
       .map((row) => ({
         id: row.id,
-        title: row.title,
+        title: row.name?.trim() || row.title,
+        fallbackTitle: row.title,
         cwd: row.cwd,
         projectId: row.project_id,
         archived: row.archived === 1,

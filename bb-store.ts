@@ -168,15 +168,22 @@ export class BbStore {
       return [{ id: row.id, data: JSON.stringify(data) }];
     });
     const originalTitle = source.title.trim();
+    const fallbackTitle = source.fallbackTitle?.trim() ?? originalTitle;
     const nextTitle = formatTitle(source.title, titleMode, titleMaxLength);
     const current = this.db.prepare("SELECT title FROM threads WHERE id=?").get(existing.threadId) as { title: string | null };
-    const managedTitle = current.title === originalTitle || Array.from({ length: 171 }, (_, index) => index + 30)
-      .some((length) => current.title === formatTitle(originalTitle, "truncate", length));
+    const managedTitle = (current.title === null && !fallbackTitle) || [originalTitle, fallbackTitle].some((candidate) =>
+      current.title === candidate || Array.from({ length: 171 }, (_, index) => index + 30)
+        .some((length) => current.title === formatTitle(candidate, "truncate", length)));
     const retitle = Boolean(originalTitle && managedTitle && current.title !== nextTitle);
     if (fixes.length || retitle) this.db.transaction(() => {
       const updateEvent = this.db.prepare("UPDATE events SET data=? WHERE id=?");
       for (const fix of fixes) updateEvent.run(fix.data, fix.id);
-      if (retitle) this.db.prepare("UPDATE threads SET title=? WHERE id=?").run(nextTitle, existing.threadId);
+      if (retitle) {
+        this.db.prepare("UPDATE threads SET title=? WHERE id=?").run(nextTitle, existing.threadId);
+        this.db.prepare(`INSERT INTO thread_search_segments(id,thread_id,source_kind,source_key,source_seq,text,created_at,updated_at)
+          VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET text=excluded.text,updated_at=excluded.updated_at`)
+          .run(`${existing.threadId}:title:title`, existing.threadId, "title", "title", null, originalTitle, Date.now(), Date.now());
+      }
     }).immediate();
     return { events: fixes.length, title: retitle };
   }

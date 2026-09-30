@@ -6,6 +6,34 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { CodexCatalog } from "./.tmp-test/source.js";
 
+test("uses the Codex chat name ahead of the first-message title", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bb-codex-titles-"));
+  const db = new Database(join(directory, "state_5.sqlite"));
+  try {
+    db.exec(`CREATE TABLE projects(id TEXT);
+      CREATE TABLE project_roots(path TEXT);
+      CREATE TABLE threads(id TEXT PRIMARY KEY,project_id TEXT,title TEXT,name TEXT,cwd TEXT,
+        archived INTEGER,archived_at INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER,
+        created_at INTEGER,updated_at INTEGER,model TEXT,reasoning_effort TEXT,source TEXT)`);
+    const insert = db.prepare("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    insert.run("named", "project", "First user message", "  Useful chat name  ", directory, 0, null, 1000, 2000, 1, 2, null, null, "cli");
+    insert.run("unnamed", "project", "Another first message", null, directory, 0, null, 2000, 3000, 2, 3, null, null, "cli");
+    insert.run("blank", "project", "Third first message", "   ", directory, 0, null, 3000, 4000, 3, 4, null, null, "cli");
+    const catalog = new CodexCatalog(directory);
+    try {
+      const threads = catalog.threads({ id: "project", name: "Project", roots: [directory], createdAtMs: 0 });
+      assert.deepEqual(threads.map(({ title, fallbackTitle }) => ({ title, fallbackTitle })), [
+        { title: "Useful chat name", fallbackTitle: "First user message" },
+        { title: "Another first message", fallbackTitle: "Another first message" },
+        { title: "Third first message", fallbackTitle: "Third first message" },
+      ]);
+    } finally { catalog.close(); }
+  } finally {
+    if (db.open) db.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("recovers an attachment by its exact path from a long compacted history line", async () => {
   const directory = mkdtempSync(join(tmpdir(), "bb-codex-images-"));
   const rolloutPath = join(directory, "rollout.jsonl");
