@@ -242,6 +242,206 @@ test("multi-root project creates one BB project per directory", async () => {
   }
 });
 
+test("worktree chats choose the project root from the same Git repository when root basenames collide", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "bb-codex-worktree-root-"));
+  const codexHome = join(directory, "codex");
+  const bbHome = join(directory, "bb");
+  const main = join(directory, "api-gateway");
+  const otherRepository = join(directory, "helm-onecloud");
+  const collidingRoot = join(otherRepository, "releases", "api-gateway");
+  const worktree = join(directory, ".codex", "worktrees", "abcd", "api-gateway");
+  const { mkdirSync } = await import("node:fs");
+  for (const path of [codexHome, bbHome, main, collidingRoot, join(directory, ".codex", "worktrees", "abcd")]) {
+    mkdirSync(path, { recursive: true });
+  }
+  try {
+    execFileSync("git", ["-C", main, "init"], { stdio: "ignore" });
+    writeFileSync(join(main, "README.md"), "test\n");
+    execFileSync("git", ["-C", main, "add", "README.md"], { stdio: "ignore" });
+    execFileSync("git", ["-C", main, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "init"], { stdio: "ignore" });
+    execFileSync("git", ["-C", main, "worktree", "add", "--detach", worktree], { stdio: "ignore" });
+    execFileSync("git", ["-C", otherRepository, "init"], { stdio: "ignore" });
+
+    const source = new Database(join(codexHome, "state_5.sqlite"));
+    source.exec(`
+      CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,position INTEGER NOT NULL,created_at_ms INTEGER NOT NULL);
+      CREATE TABLE project_roots(project_id TEXT NOT NULL,position INTEGER NOT NULL,path TEXT NOT NULL);
+      CREATE TABLE threads(id TEXT PRIMARY KEY,project_id TEXT,title TEXT,cwd TEXT,archived INTEGER,archived_at INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER,created_at INTEGER,updated_at INTEGER,model TEXT,reasoning_effort TEXT,source TEXT);
+    `);
+    source.prepare("INSERT INTO projects VALUES(?,?,?,?)").run("src_collision", "API-Gateway", 0, 100);
+    source.prepare("INSERT INTO project_roots VALUES(?,?,?)").run("src_collision", 0, main);
+    source.prepare("INSERT INTO project_roots VALUES(?,?,?)").run("src_collision", 1, collidingRoot);
+    source.prepare("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run("chat_worktree", "src_collision", "Worktree chat", worktree, 0, null, 100, 200, 1, 2, null, null, "vscode");
+    source.close();
+
+    const target = new Database(join(bbHome, "bb.db"));
+    target.exec(`
+      CREATE TABLE threads(id TEXT,project_id TEXT,environment_id TEXT,provider_id TEXT,status TEXT,archived_at INTEGER,created_at INTEGER,updated_at INTEGER,deleted_at INTEGER);
+      CREATE TABLE environments(id TEXT,project_id TEXT,host_id TEXT,path TEXT,status TEXT,environment_provider_id TEXT,environment_provider_selection TEXT);
+      CREATE TABLE events(id TEXT,thread_id TEXT,environment_id TEXT,scope_kind TEXT,turn_id TEXT,provider_thread_id TEXT,sequence INTEGER,type TEXT,item_kind TEXT,data TEXT,created_at INTEGER);
+      CREATE TABLE thread_search_segments(id TEXT,thread_id TEXT,source_kind TEXT,source_key TEXT,source_seq INTEGER,text TEXT,created_at INTEGER,updated_at INTEGER);
+    `);
+    target.close();
+
+    const prior = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = codexHome;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "codex-migrate", dataDir: bbHome,
+      sdk: {
+        system: { config: async () => ({ primaryHostId: "host_test" }) },
+        projects: { list: async () => [] },
+      },
+    });
+    try {
+      await plugin(bb);
+      const preview = await harness.behavior.callRpc("scan", { projects: ["src_collision"], all: false, includeThreads: true });
+      assert.equal(preview.projects[0].conflicts.length, 0);
+      assert.deepEqual(preview.projects[0].rootDetails.map((root) => root.candidates), [1, 0]);
+      await harness.lifecycle.dispose();
+    } finally {
+      if (prior === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prior;
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("paginated thread/read errors fall back to the complete rollout when the projection is incomplete", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "bb-codex-paginated-fallback-"));
+  const codexHome = join(directory, "codex");
+  const bbHome = join(directory, "bb");
+  const root = join(directory, "repository");
+  const rolloutPath = join(codexHome, "rollout.jsonl");
+  const emptyRolloutPath = join(codexHome, "empty-rollout.jsonl");
+  const partialRolloutPath = join(codexHome, "partial-rollout.jsonl");
+  const mockCli = join(directory, "mock-codex");
+  const { mkdirSync, statSync } = await import("node:fs");
+  for (const path of [codexHome, bbHome, root]) mkdirSync(path);
+  try {
+    execFileSync("git", ["-C", root, "init"], { stdio: "ignore" });
+    writeFileSync(rolloutPath, [
+      { timestamp: "2026-08-25T14:40:49.782Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn_1", started_at: 1 } },
+      { timestamp: "2026-08-25T14:40:50.000Z", type: "event_msg", payload: { type: "item_completed", turn_id: "turn_1", item: {
+        type: "UserMessage", id: "item_1", client_id: "client_1", content: [{ type: "text", text: "hello" }],
+      } } },
+      { timestamp: "2026-08-25T14:40:51.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "turn_1", completed_at: 2 } },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    writeFileSync(emptyRolloutPath, JSON.stringify({ type: "session_meta", payload: {} }) + "\n");
+    writeFileSync(partialRolloutPath, [
+      { timestamp: "2026-08-25T14:41:49.782Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn_partial", started_at: 3 } },
+      { timestamp: "2026-08-25T14:41:50.000Z", type: "event_msg", payload: { type: "item_completed", turn_id: "turn_partial", item: {
+        type: "UserMessage", id: "item_partial", client_id: "client_partial", content: [
+          { type: "text", text: "inspect this" }, { type: "localImage", path: "/missing/screenshot.png" },
+        ],
+      } } },
+      { timestamp: "2026-08-25T14:41:51.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "turn_partial", completed_at: 4 } },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    const source = new Database(join(codexHome, "state_5.sqlite"));
+    source.exec(`
+      CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,position INTEGER NOT NULL,created_at_ms INTEGER NOT NULL);
+      CREATE TABLE project_roots(project_id TEXT NOT NULL,position INTEGER NOT NULL,path TEXT NOT NULL);
+      CREATE TABLE threads(id TEXT PRIMARY KEY,project_id TEXT,title TEXT,cwd TEXT,archived INTEGER,archived_at INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER,created_at INTEGER,updated_at INTEGER,model TEXT,reasoning_effort TEXT,source TEXT,rollout_path TEXT,has_user_event INTEGER DEFAULT 0,tokens_used INTEGER DEFAULT 0,first_user_message TEXT DEFAULT '',preview TEXT DEFAULT '');
+    `);
+    source.prepare("INSERT INTO projects VALUES(?,?,?,?)").run("src_projection", "Projection", 0, 100);
+    source.prepare("INSERT INTO project_roots VALUES(?,?,?)").run("src_projection", 0, root);
+    source.prepare("INSERT INTO threads(id,project_id,title,cwd,archived,archived_at,created_at_ms,updated_at_ms,created_at,updated_at,model,reasoning_effort,source,rollout_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run("chat_projection", "src_projection", "Projected chat", root, 0, null, 100, 200, 1, 2, null, null, "vscode", rolloutPath);
+    source.prepare("INSERT INTO threads(id,project_id,title,cwd,archived,archived_at,created_at_ms,updated_at_ms,created_at,updated_at,model,reasoning_effort,source,rollout_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run("chat_empty", "src_projection", "", root, 0, null, 3000, 3000, 3, 3, null, null, "vscode", emptyRolloutPath);
+    source.prepare("INSERT INTO threads(id,project_id,title,cwd,archived,archived_at,created_at_ms,updated_at_ms,created_at,updated_at,model,reasoning_effort,source,rollout_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run("chat_partial", "src_projection", "Partial chat", root, 0, null, 3000, 4000, 3, 4, null, null, "vscode", partialRolloutPath);
+    source.close();
+
+    const projection = new Database(join(codexHome, "thread_history_1.sqlite"));
+    projection.exec(`
+      CREATE TABLE thread_history_projection_state(thread_id TEXT,next_rollout_byte_offset INTEGER);
+      CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,status TEXT,started_at INTEGER,completed_at INTEGER,rollout_ordinal INTEGER);
+      CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,item_json TEXT,rollout_ordinal INTEGER);
+    `);
+    projection.prepare("INSERT INTO thread_history_projection_state VALUES(?,?)").run("chat_projection", 0);
+    projection.prepare("INSERT INTO thread_history_projection_state VALUES(?,?)").run("chat_empty", statSync(emptyRolloutPath).size);
+    projection.prepare("INSERT INTO thread_history_projection_state VALUES(?,?)").run("chat_partial", 0);
+    projection.close();
+
+    const target = new Database(join(bbHome, "bb.db"));
+    target.exec(`
+      CREATE TABLE threads(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,environment_id TEXT,provider_id TEXT NOT NULL,status TEXT NOT NULL,title TEXT,archived_at INTEGER,last_read_at INTEGER,latest_attention_at INTEGER NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,visibility TEXT NOT NULL,deleted_at INTEGER);
+      CREATE TABLE environments(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,host_id TEXT NOT NULL,path TEXT,status TEXT NOT NULL,is_git_repo INTEGER,is_worktree INTEGER,environment_provider_id TEXT,environment_provider_selection TEXT,environment_provider_instance_key TEXT,provider_owns_path INTEGER,created_at INTEGER,updated_at INTEGER);
+      CREATE TABLE events(id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,environment_id TEXT,scope_kind TEXT NOT NULL,turn_id TEXT,provider_thread_id TEXT,sequence INTEGER NOT NULL,type TEXT NOT NULL,item_id TEXT,item_kind TEXT,data TEXT NOT NULL,created_at INTEGER NOT NULL,parent_tool_call_id TEXT);
+      CREATE TABLE thread_search_segments(id TEXT PRIMARY KEY,thread_id TEXT NOT NULL,source_kind TEXT NOT NULL,source_key TEXT NOT NULL,source_seq INTEGER,text TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+      CREATE TABLE project_attachments(id TEXT PRIMARY KEY,project_id TEXT NOT NULL,stored_path TEXT NOT NULL,ready_at INTEGER);
+      CREATE TABLE project_attachment_threads(attachment_id TEXT NOT NULL,thread_id TEXT NOT NULL,PRIMARY KEY(attachment_id,thread_id));
+    `);
+    target.close();
+
+    writeFileSync(mockCli, `#!/usr/bin/env node
+let pending = "";
+process.stdin.on("data", (chunk) => {
+  pending += chunk.toString();
+  let end;
+  while ((end = pending.indexOf("\\n")) >= 0) {
+    const line = pending.slice(0, end); pending = pending.slice(end + 1);
+    const request = JSON.parse(line);
+    if (typeof request.id !== "number") continue;
+    if (request.method === "thread/read") {
+      process.stdout.write(JSON.stringify({ id: request.id, error: { message: "paginated threads do not support thread/read(includeTurns=true)" } }) + "\\n");
+    } else process.stdout.write(JSON.stringify({ id: request.id, result: {} }) + "\\n");
+  }
+});
+`);
+    chmodSync(mockCli, 0o755);
+    const priorHome = process.env.CODEX_HOME;
+    const priorCli = process.env.CODEX_CLI;
+    process.env.CODEX_HOME = codexHome;
+    process.env.CODEX_CLI = mockCli;
+    const projects = [];
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "codex-migrate", dataDir: bbHome,
+      sdk: {
+        system: { config: async () => ({ primaryHostId: "host_test" }) },
+        projects: {
+          list: async () => projects,
+          create: async (input) => {
+            const created = { id: "proj_projection", name: input.name,
+              sources: [{ id: "source_projection", hostId: input.source.hostId, path: input.source.path, isDefault: true }] };
+            projects.push(created);
+            return created;
+          },
+        },
+      },
+    });
+    try {
+      await plugin(bb);
+      const result = await harness.behavior.runCli(["apply", "--project", "src_projection", "--json"]);
+      assert.equal(result.exitCode, 0);
+      const report = JSON.parse(result.stdout).projects[0];
+      assert.deepEqual({ imported: report.imported, partiallyImported: report.partiallyImported, skippedEmpty: report.skippedEmpty, failed: report.failed.length },
+        { imported: 1, partiallyImported: [{ sourceId: "chat_partial", message: "Unavailable attachments: chat_partial: localImage /missing/screenshot.png" }], skippedEmpty: 1, failed: 0 });
+      const status = await harness.behavior.callRpc("status", null);
+      assert.equal(status.current.partiallyImported, 1);
+      assert.equal(status.current.projectProgress[0].partiallyImported, 1);
+      assert.equal(status.current.projectProgress[0].state, "partial");
+      const imported = new Database(join(bbHome, "bb.db"), { readonly: true });
+      const partialEvent = imported.prepare(`SELECT data FROM events WHERE type='client/turn/requested' AND data LIKE '%Attachment unavailable:%'`).get();
+      imported.close();
+      assert.deepEqual(JSON.parse(partialEvent.data).input, [
+        { type: "text", text: "inspect this", mentions: [] },
+        { type: "text", text: "[Attachment unavailable: /missing/screenshot.png]", mentions: [] },
+      ]);
+      await harness.lifecycle.dispose();
+    } finally {
+      if (priorHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = priorHome;
+      if (priorCli === undefined) delete process.env.CODEX_CLI;
+      else process.env.CODEX_CLI = priorCli;
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test("existing chats in a BB subfolder project block silent rerouting to the parent repository", async () => {
   const directory = mkdtempSync(join(tmpdir(), "bb-codex-parent-conflict-"));
   const codexHome = join(directory, "codex");

@@ -73,7 +73,7 @@ test("recovers an attachment by its exact path from a long compacted history lin
   }
 });
 
-test("uses a complete local Codex projection when thread/read cannot answer", () => {
+test("prefers a complete local Codex projection over the raw rollout", async () => {
   const directory = mkdtempSync(join(tmpdir(), "bb-codex-projection-"));
   const rolloutPath = join(directory, "rollout.jsonl");
   writeFileSync(rolloutPath, "{}\n");
@@ -90,13 +90,52 @@ test("uses a complete local Codex projection when thread/read cannot answer", ()
     history.close();
     const catalog = new CodexCatalog(directory);
     try {
-      assert.deepEqual(catalog.projectedThread("thread_1"), { id: "thread_1", createdAt: 123, turns: [
+      assert.deepEqual(await catalog.localThread("thread_1"), { id: "thread_1", createdAt: 123, turns: [
         { id: "turn_1", status: "completed", startedAt: 124, completedAt: 125, items: [{ type: "userMessage", id: "item_1", content: [{ type: "text", text: "hello" }] }] },
       ] });
     } finally { catalog.close(); }
   } finally {
     if (state.open) state.close();
     if (history.open) history.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("reconstructs paginated turns directly from the complete rollout", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "bb-codex-rollout-"));
+  const rolloutPath = join(directory, "rollout.jsonl");
+  const state = new Database(join(directory, "state_5.sqlite"));
+  try {
+    state.exec("CREATE TABLE projects(id TEXT); CREATE TABLE project_roots(path TEXT); CREATE TABLE threads(id TEXT PRIMARY KEY,rollout_path TEXT,created_at INTEGER)");
+    state.prepare("INSERT INTO threads VALUES(?,?,?)").run("thread_1", rolloutPath, 123);
+    state.close();
+    const records = [
+      { timestamp: "2026-08-25T14:40:49.782Z", type: "event_msg", payload: { type: "task_started", turn_id: "turn_1", started_at: 124 } },
+      { timestamp: "2026-08-25T14:40:50.000Z", type: "event_msg", payload: { type: "item_completed", turn_id: "turn_1", item: {
+        type: "UserMessage", id: "user_1", client_id: "client_1", content: [{ type: "text", text: "hello" }],
+      } } },
+      { timestamp: "2026-08-25T14:40:51.000Z", type: "event_msg", payload: { type: "item_completed", turn_id: "turn_1", item: {
+        type: "CommandExecution", id: "command_1", command: ["/bin/zsh", "-lc", "pwd"], cwd: "file:///tmp/project",
+        status: "completed", aggregated_output: "/tmp/project\n", exit_code: 0, duration: { secs: 1, nanos: 500_000_000 },
+      } } },
+      { timestamp: "2026-08-25T14:40:52.000Z", type: "event_msg", payload: { type: "item_completed", turn_id: "turn_1", item: {
+        type: "AgentMessage", id: "agent_1", content: "done", phase: "final_answer",
+      } } },
+      { timestamp: "2026-08-25T14:40:53.000Z", type: "event_msg", payload: { type: "task_complete", turn_id: "turn_1", completed_at: 128 } },
+    ];
+    writeFileSync(rolloutPath, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+    const catalog = new CodexCatalog(directory);
+    try {
+      assert.deepEqual(await catalog.rolloutThread("thread_1"), { id: "thread_1", createdAt: 123, turns: [{
+        id: "turn_1", status: "completed", startedAt: 124, completedAt: 128, items: [
+          { type: "userMessage", id: "user_1", clientId: "client_1", content: [{ type: "text", text: "hello" }] },
+          { type: "commandExecution", id: "command_1", command: "/bin/zsh -lc pwd", cwd: "/tmp/project", status: "completed", aggregatedOutput: "/tmp/project\n", exitCode: 0, durationMs: 1500 },
+          { type: "agentMessage", id: "agent_1", text: "done", phase: "final_answer" },
+        ],
+      }] });
+    } finally { catalog.close(); }
+  } finally {
+    if (state.open) state.close();
     rmSync(directory, { recursive: true, force: true });
   }
 });
@@ -116,6 +155,29 @@ test("skips only a verified empty placeholder without a source rollout", () => {
       state.prepare("UPDATE threads SET tokens_used=1 WHERE id=?").run("thread_1");
       assert.equal(catalog.isEmptyPlaceholder("thread_1"), false);
     } finally { catalog.close(); }
+  } finally {
+    if (state.open) state.close();
+    if (history.open) history.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("skips a verified empty placeholder with a fully projected metadata-only rollout", () => {
+  const directory = mkdtempSync(join(tmpdir(), "bb-codex-empty-rollout-"));
+  const rolloutPath = join(directory, "rollout.jsonl");
+  writeFileSync(rolloutPath, JSON.stringify({ type: "session_meta", payload: {} }) + "\n");
+  const state = new Database(join(directory, "state_5.sqlite"));
+  const history = new Database(join(directory, "thread_history_1.sqlite"));
+  try {
+    state.exec("CREATE TABLE projects(id TEXT); CREATE TABLE project_roots(path TEXT); CREATE TABLE threads(id TEXT PRIMARY KEY,title TEXT,rollout_path TEXT,has_user_event INTEGER,tokens_used INTEGER,first_user_message TEXT,preview TEXT,created_at INTEGER,updated_at INTEGER)");
+    state.prepare("INSERT INTO threads VALUES(?,?,?,?,?,?,?,?,?)").run("thread_1", "", rolloutPath, 0, 0, "", "", 123, 123);
+    history.exec("CREATE TABLE thread_history_projection_state(thread_id TEXT,next_rollout_byte_offset INTEGER); CREATE TABLE thread_turns(thread_id TEXT); CREATE TABLE thread_items(thread_id TEXT)");
+    history.prepare("INSERT INTO thread_history_projection_state VALUES(?,?)").run("thread_1", statSync(rolloutPath).size);
+    state.close();
+    history.close();
+    const catalog = new CodexCatalog(directory);
+    try { assert.equal(catalog.isEmptyPlaceholder("thread_1"), true); }
+    finally { catalog.close(); }
   } finally {
     if (state.open) state.close();
     if (history.open) history.close();

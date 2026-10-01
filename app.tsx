@@ -106,7 +106,7 @@ function CodexMigrationPage() {
                 <span>All</span>
               </label>
               {current && <div className="ml-7 mt-2 text-xs text-muted-foreground" role="status" aria-live="polite">
-                <p><span className="font-medium">{current.state === "running" ? "Importing" : `Last import: ${current.state}`}</span> · {current.processed} / {current.total} chats · {current.imported} added this run · {current.existing} already in BB · {current.skippedEmpty} empty skipped{current.failed > 0 ? ` · ${current.failed} failed` : ""}</p>
+                <p><span className="font-medium">{current.state === "running" ? "Importing" : `Last import: ${current.state}`}</span> · {current.processed} / {current.total} chats · {current.imported} added this run{current.partiallyImported > 0 ? ` · ${current.partiallyImported} partially imported` : ""} · {current.existing} already in BB · {current.skippedEmpty} empty skipped{current.failed > 0 ? ` · ${current.failed} failed` : ""}</p>
                 {current.total > 0 && <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted" aria-hidden="true"><div className="h-full bg-primary" style={{ width: `${progressPercent}%` }} /></div>}
                 {currentFolder && <p className="mt-1 truncate">Current folder: {currentFolder}</p>}
                 {current.currentThread && <p className="truncate">Current chat: {current.currentThread}</p>}
@@ -132,7 +132,7 @@ function CodexMigrationPage() {
                         <span className="block break-all">{root.path}</span>
                         <span className="block text-muted-foreground">{root.kind === "subfolder" ? "Git subfolder" : root.kind === "worktree" ? "Git worktree" : root.kind === "non-git" ? "No Git repository" : root.kind === "missing" ? "Missing folder" : "Git repository"} → {root.targetProjectName}{root.linkedProjects.length > 1 ? ` · shared with ${root.linkedProjects.filter((name) => name !== project.name).join(", ")}` : ""}</span>
                         {status && <span className="mt-1 block text-muted-foreground" role="status">
-                          <span className="font-medium">{status.state}</span> · {status.processed} / {status.total} chats · {status.imported} added this run · {status.existing} already in BB · {status.skippedEmpty} empty skipped{status.failed > 0 ? ` · ${status.failed} failed` : ""}
+                          <span className="font-medium">{status.state}</span> · {status.processed} / {status.total} chats · {status.imported} added this run{status.partiallyImported > 0 ? ` · ${status.partiallyImported} partially imported` : ""} · {status.existing} already in BB · {status.skippedEmpty} empty skipped{status.failed > 0 ? ` · ${status.failed} failed` : ""}
                           {status.total > 0 && <span className="mt-1 block h-1.5 overflow-hidden rounded-full bg-muted" aria-hidden="true"><span className="block h-full bg-primary" style={{ width: `${Math.min(100, Math.round(status.processed / status.total * 100))}%` }} /></span>}
                           {status.currentThread && <span className="block truncate">Current: {status.currentThread}</span>}
                           {status.error && <span className="block text-destructive">{status.error}</span>}
@@ -173,7 +173,7 @@ function CodexMigrationPage() {
             {unresolvedConflicts.length > 0 && <p className="mt-2 text-sm text-destructive">{unresolvedConflicts.length} conflicts still block import.</p>}
             <p className="text-sm">{eligibleRoots.length} unique folders will be imported. A BB database backup is created before BB changes.</p>
             <Button className="mt-3" onClick={startImport} disabled={starting || current?.state === "running" || eligibleRoots.length === 0 || uniqueRoots.some((root) => root.kind === "missing") || unresolvedConflicts.length > 0}>{current?.state === "running" ? `Importing ${current.processed} / ${current.total}…` : starting ? "Starting import…" : "Import selected folders"}</Button>
-            {current?.state === "running" && <p className="mt-2 text-xs text-muted-foreground" role="status">{current.imported} added this run · {current.existing} already in BB · {current.skippedEmpty} empty skipped{current.failed > 0 ? ` · ${current.failed} failed` : ""}{currentFolder ? ` · ${currentFolder}` : ""} · Updated {new Date(current.updatedAt).toLocaleTimeString()}</p>}
+            {current?.state === "running" && <p className="mt-2 text-xs text-muted-foreground" role="status">{current.imported} added this run{current.partiallyImported > 0 ? ` · ${current.partiallyImported} partially imported` : ""} · {current.existing} already in BB · {current.skippedEmpty} empty skipped{current.failed > 0 ? ` · ${current.failed} failed` : ""}{currentFolder ? ` · ${currentFolder}` : ""} · Updated {new Date(current.updatedAt).toLocaleTimeString()}</p>}
           </div>
         </div>}
       </div>

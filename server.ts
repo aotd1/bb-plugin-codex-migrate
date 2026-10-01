@@ -29,6 +29,7 @@ const summarySchema = z.object({
 const projectReportSchema = z.object({
   sourceId: z.string(), name: z.string(), targetProjectId: z.string(), targetProjectIds: z.array(z.string()), candidates: z.number(),
   imported: z.number(), existing: z.number(), skippedEmpty: z.number(), uploadedAttachments: z.number(),
+  partiallyImported: z.array(z.object({ sourceId: z.string(), message: z.string() })),
   failed: z.array(z.object({ sourceId: z.string(), message: z.string() })),
   mismatches: z.array(z.object({ sourceId: z.string(), field: z.string(), source: z.union([z.number(), z.boolean()]), target: z.union([z.number(), z.boolean()]) })),
 });
@@ -39,7 +40,7 @@ const reportSchema = z.object({
 const projectProgressSchema = z.object({
   sourceId: z.string(), name: z.string(),
   state: z.enum(["queued", "running", "completed", "partial", "failed", "interrupted"]),
-  processed: z.number(), total: z.number(), imported: z.number(), existing: z.number(), skippedEmpty: z.number(), failed: z.number(),
+  processed: z.number(), total: z.number(), imported: z.number(), partiallyImported: z.number(), existing: z.number(), skippedEmpty: z.number(), failed: z.number(),
   currentThread: z.string().nullable(), updatedAt: z.string(), error: z.string().nullable(),
 });
 const runStatusSchema = z.object({
@@ -47,7 +48,7 @@ const runStatusSchema = z.object({
   projects: z.array(z.string()), startedAt: z.string(), updatedAt: z.string(), completedAt: z.string().nullable(),
   projectProgress: z.array(projectProgressSchema),
   currentProject: z.string().nullable(), currentThread: z.string().nullable(),
-  processed: z.number(), total: z.number(), imported: z.number(), existing: z.number(), skippedEmpty: z.number(), failed: z.number(),
+  processed: z.number(), total: z.number(), imported: z.number(), partiallyImported: z.number(), existing: z.number(), skippedEmpty: z.number(), failed: z.number(),
   error: z.string().nullable(),
 });
 export type ProjectSummary = z.infer<typeof summarySchema>;
@@ -93,6 +94,7 @@ interface ProjectReport {
   targetProjectIds: string[];
   candidates: number;
   imported: number;
+  partiallyImported: { sourceId: string; message: string }[];
   existing: number;
   skippedEmpty: number;
   uploadedAttachments: number;
@@ -109,19 +111,45 @@ interface ApplyReport {
 
 function progressFromReport(report: ProjectReport, updatedAt: string): z.infer<typeof projectProgressSchema> {
   return {
-    sourceId: report.sourceId, name: report.name, state: "completed",
-    processed: report.imported + report.existing + report.skippedEmpty + report.failed.length,
-    total: report.candidates, imported: report.imported, existing: report.existing,
+    sourceId: report.sourceId, name: report.name, state: report.partiallyImported.length > 0 ? "partial" : "completed",
+    processed: report.imported + report.partiallyImported.length + report.existing + report.skippedEmpty + report.failed.length,
+    total: report.candidates, imported: report.imported, partiallyImported: report.partiallyImported.length, existing: report.existing,
     skippedEmpty: report.skippedEmpty, failed: report.failed.length,
     currentThread: null, updatedAt, error: null,
   };
+}
+
+function normalizeReport(report: ApplyReport | null): ApplyReport | null {
+  if (!report) return null;
+  return {
+    ...report,
+    projects: report.projects.map((project) => ({ ...project, partiallyImported: project.partiallyImported ?? [] })),
+  };
+}
+
+function normalizeStatus(status: RunStatus | null): RunStatus | null {
+  if (!status) return null;
+  return {
+    ...status,
+    partiallyImported: status.partiallyImported ?? 0,
+    projectProgress: Array.isArray(status.projectProgress)
+      ? status.projectProgress.map((project) => ({ ...project, partiallyImported: project.partiallyImported ?? 0 }))
+      : status.projectProgress,
+  };
+}
+
+function canUseLocalHistory(cause: unknown): cause is Error {
+  return cause instanceof Error && (
+    cause.message.includes("thread/read timed out after 60 seconds") ||
+    cause.message.includes("paginated threads do not support thread/read")
+  );
 }
 
 function conflictFor(thread: SourceThread, project: SourceProject, targetId: string | null,
   catalog: CodexCatalog, store: BbStore, allProjects: SourceProject[], routeFor = folderRoute): z.infer<typeof conflictSchema> | null {
   const existing = store.existing(thread.id);
   const owners = catalog.owners(thread, allProjects);
-  const root = rootForThread(project, thread);
+  const root = rootForThread(project, thread, routeFor);
   if (!root) return { sourceId: thread.id, title: thread.title, cwd: thread.cwd,
     reason: "Chat directory does not match a project root", owners: owners.map((owner) => ({ id: owner.id, name: owner.name })), importedProjectId: existing?.projectId ?? null };
   const rootRoute = routeFor(root);
@@ -147,10 +175,17 @@ function matchesRoot(thread: SourceThread, root: string): boolean {
   return Boolean(basename && thread.cwd.includes("/.codex/worktrees/") && thread.cwd.endsWith(`/${basename}`));
 }
 
-function rootForThread(project: SourceProject, thread: SourceThread): string | null {
+function rootForThread(project: SourceProject, thread: SourceThread, routeFor = folderRoute): string | null {
   const exact = project.roots.find((root) => thread.cwd === root);
   if (exact) return exact;
   const matches = project.roots.filter((root) => matchesRoot(thread, root)).sort((a, b) => b.length - a.length);
+  if (matches.length > 1) {
+    const threadTarget = routeFor(thread.cwd).targetPath;
+    if (threadTarget) {
+      const sameRepository = matches.find((root) => routeFor(root).targetPath === threadTarget);
+      if (sameRepository) return sameRepository;
+    }
+  }
   return matches[0] ?? null;
 }
 
@@ -230,17 +265,17 @@ export default async function plugin(bb: BbPluginApi) {
   let disposed = false;
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let statusWrite: Promise<void> = Promise.resolve();
-  let active: RunStatus | null = await bb.storage.kv.get<RunStatus>("current-run") ?? null;
+  let active: RunStatus | null = normalizeStatus(await bb.storage.kv.get<RunStatus>("current-run") ?? null);
   const dataDir = bb.server.experimental_dataDir;
   if (active && !Array.isArray(active.projectProgress)) {
-    const priorReport = await bb.storage.kv.get<ApplyReport>("last-run") ?? null;
+    const priorReport = normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null);
     active = {
       ...active,
       projectProgress: priorReport?.startedAt === active.startedAt
         ? priorReport.projects.map((report) => progressFromReport(report, active!.updatedAt))
         : active.projects.filter((name) => name !== "--all").map((name) => ({
           sourceId: name, name, state: "interrupted" as const, processed: 0, total: 0,
-          imported: 0, existing: 0, skippedEmpty: 0, failed: 0,
+          imported: 0, partiallyImported: 0, existing: 0, skippedEmpty: 0, failed: 0,
           currentThread: null, updatedAt: active!.updatedAt, error: active!.error,
         })),
     };
@@ -285,12 +320,12 @@ export default async function plugin(bb: BbPluginApi) {
       return selected.map((project) => {
         const projectRoots = selectedKeys ? project.roots.filter((root) => selectedKeys.has(routeFor(root).key)) : project.roots;
         const threads = catalog.threads(project).filter((thread) => {
-          const root = rootForThread(project, thread);
+          const root = rootForThread(project, thread, routeFor);
           return root !== null && projectRoots.includes(root);
         });
         const existing = threads.map((thread) => store.existing(thread.id));
         const conflicts = includeThreads ? threads.map((thread) => {
-          const root = rootForThread(project, thread);
+          const root = rootForThread(project, thread, routeFor);
           const matching = root ? matches(routeFor(thread.cwd).targetPath ?? routeFor(root).targetPath) : [];
           return conflictFor(thread, project, matching.length === 1 ? matching[0]!.id : null, catalog, store, allProjects, routeFor);
         }).filter((item) => item !== null) : [];
@@ -304,7 +339,7 @@ export default async function plugin(bb: BbPluginApi) {
             const route = routeFor(path);
             const matching = matches(route.targetPath);
             return { path, key: route.key, kind: route.kind, exists: route.exists, git: route.git, targetPath: route.targetPath,
-              candidates: threads.filter((thread) => rootForThread(project, thread) === path).length,
+              candidates: threads.filter((thread) => rootForThread(project, thread, routeFor) === path).length,
               targetProjectId: matching.length === 1 ? matching[0]!.id : null,
               targetProjectName: matching.length > 1 ? "Ambiguous BB projects" : matching[0]?.name ?? suggestedName(allProjects, route, routeFor),
               linkedProjects: [...new Set(allProjects.filter((item) => item.roots.some((root) => routeFor(root).key === route.key)).map((item) => item.name))] };
@@ -362,11 +397,11 @@ export default async function plugin(bb: BbPluginApi) {
       startedAt, updatedAt: startedAt, completedAt: null,
       projectProgress: options.projects.map((name) => ({
         sourceId: name, name, state: "queued", processed: 0, total: 0,
-        imported: 0, existing: 0, skippedEmpty: 0, failed: 0,
+        imported: 0, partiallyImported: 0, existing: 0, skippedEmpty: 0, failed: 0,
         currentThread: null, updatedAt: startedAt, error: null,
       })),
       currentProject: null, currentThread: null,
-      processed: 0, total: 0, imported: 0, existing: 0, skippedEmpty: 0, failed: 0, error: null,
+      processed: 0, total: 0, imported: 0, partiallyImported: 0, existing: 0, skippedEmpty: 0, failed: 0, error: null,
     };
     let catalog: CodexCatalog | null = null;
     let store: BbStore | null = null;
@@ -417,7 +452,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
       }
       for (const project of selected) for (const thread of openedCatalog.threads(project)) {
-        const root = rootForThread(project, thread);
+        const root = rootForThread(project, thread, routeFor);
         if (!root) continue;
         const folder = folders.get(routeFor(root).key);
         if (folder) folder.candidates.set(thread.id, thread);
@@ -440,7 +475,7 @@ export default async function plugin(bb: BbPluginApi) {
         total: plans.reduce((sum, plan) => sum + plan.candidates.length, 0),
         projectProgress: plans.map(({ key, project, root, candidates }) => ({
           sourceId: key, name: folderLabel(project, root), state: "queued" as const,
-          processed: 0, total: candidates.length, imported: 0, existing: 0,
+          processed: 0, total: candidates.length, imported: 0, partiallyImported: 0, existing: 0,
           skippedEmpty: 0, failed: 0, currentThread: null,
           updatedAt: new Date().toISOString(), error: null,
         })),
@@ -485,7 +520,7 @@ export default async function plugin(bb: BbPluginApi) {
           routeTargets.set(targetPath, target);
         }
         const report: ProjectReport = { sourceId: key, name: folderLabel(project, key), targetProjectId: target.id, targetProjectIds: [target.id],
-          candidates: candidates.length, imported: 0, existing: 0, skippedEmpty: 0,
+          candidates: candidates.length, imported: 0, partiallyImported: [], existing: 0, skippedEmpty: 0,
           uploadedAttachments: 0, failed: [], mismatches: [] };
         reports.push(report);
         progress = { ...progress, currentProject: key, currentThread: null, updatedAt: new Date().toISOString() };
@@ -511,10 +546,14 @@ export default async function plugin(bb: BbPluginApi) {
             try {
               rawHistory = await source.readThread(thread.id);
             } catch (cause) {
-              if (!(cause instanceof Error) || !cause.message.includes("thread/read timed out after 60 seconds")) throw cause;
-              source.close();
-              source = null;
-              rawHistory = openedCatalog.projectedThread(thread.id);
+              if (!canUseLocalHistory(cause)) throw cause;
+              if (cause.message.includes("paginated threads do not support thread/read")) {
+                rawHistory = await openedCatalog.localThread(thread.id);
+              } else {
+                source.close();
+                source = null;
+                rawHistory = openedCatalog.projectedThread(thread.id);
+              }
             }
             const history = convertHistory(rawHistory, thread);
             if (disposed) throw new Error("Migration interrupted by plugin reload");
@@ -535,11 +574,14 @@ export default async function plugin(bb: BbPluginApi) {
               continue;
             }
             const attachments = await attachHistory(bb, openedCatalog, target.id, thread.id, history);
-            if (attachments.unresolved.length > 0) throw new Error(`Unresolved attachments: ${attachments.unresolved.join("; ")}`);
             if (backupPath === null) backupPath = await activeStore.backup(dataDir);
             activeStore.importThread({ projectId: target.id, hostId, projectRoot: targetPath, source: thread, history,
               titleMode: titleMode as TitleMode, titleMaxLength });
-            report.imported++;
+            if (attachments.unresolved.length > 0) {
+              report.partiallyImported.push({ sourceId: thread.id, message: `Unavailable attachments: ${attachments.unresolved.join("; ")}` });
+            } else {
+              report.imported++;
+            }
             report.uploadedAttachments += attachments.uploaded;
             remaining--;
           } catch (cause) {
@@ -547,7 +589,7 @@ export default async function plugin(bb: BbPluginApi) {
               source?.close();
               source = null;
             }
-            if (cause instanceof Error && cause.message.includes("missing source rollout") && openedCatalog.isEmptyPlaceholder(thread.id)) {
+            if (openedCatalog.isEmptyPlaceholder(thread.id)) {
               report.skippedEmpty++;
             } else {
               report.failed.push({ sourceId: thread.id, message: cause instanceof Error ? cause.message : String(cause) });
@@ -555,25 +597,26 @@ export default async function plugin(bb: BbPluginApi) {
           } finally {
             const totals = reports.reduce((sum, item) => ({
               imported: sum.imported + item.imported,
+              partiallyImported: sum.partiallyImported + item.partiallyImported.length,
               existing: sum.existing + item.existing,
               skippedEmpty: sum.skippedEmpty + item.skippedEmpty,
               failed: sum.failed + item.failed.length,
-            }), { imported: 0, existing: 0, skippedEmpty: 0, failed: 0 });
+            }), { imported: 0, partiallyImported: 0, existing: 0, skippedEmpty: 0, failed: 0 });
             progress = {
-              ...progress, processed: totals.imported + totals.existing + totals.skippedEmpty + totals.failed,
+              ...progress, processed: totals.imported + totals.partiallyImported + totals.existing + totals.skippedEmpty + totals.failed,
               ...totals,
               updatedAt: new Date().toISOString(),
             };
             updateProject(key, {
-              processed: report.imported + report.existing + report.skippedEmpty + report.failed.length,
-              imported: report.imported, existing: report.existing,
+              processed: report.imported + report.partiallyImported.length + report.existing + report.skippedEmpty + report.failed.length,
+              imported: report.imported, partiallyImported: report.partiallyImported.length, existing: report.existing,
               skippedEmpty: report.skippedEmpty, failed: report.failed.length,
             });
             await updateStatus(progress);
           }
         }
-        const handled = report.imported + report.existing + report.skippedEmpty + report.failed.length;
-        updateProject(key, { state: handled < candidates.length ? "partial" : "completed", currentThread: null });
+        const handled = report.imported + report.partiallyImported.length + report.existing + report.skippedEmpty + report.failed.length;
+        updateProject(key, { state: report.partiallyImported.length > 0 || handled < candidates.length ? "partial" : "completed", currentThread: null });
         progress = { ...progress, currentThread: null };
         await updateStatus(progress);
       }
@@ -608,8 +651,8 @@ export default async function plugin(bb: BbPluginApi) {
       });
       return { runId };
     },
-    status: async () => ({ current: active, report: await bb.storage.kv.get<ApplyReport>("last-run") ?? null }),
-    lastRun: async () => ({ report: await bb.storage.kv.get<ApplyReport>("last-run") ?? null }),
+    status: async () => ({ current: active, report: normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null) }),
+    lastRun: async () => ({ report: normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null) }),
     repair: async ({ projects, roots, bbProjectIds, all }) => repair(projects, roots ?? [], bbProjectIds ?? [], all),
   });
 
@@ -640,7 +683,7 @@ export default async function plugin(bb: BbPluginApi) {
           return { exitCode: 0, stdout: options.json ? JSON.stringify({ projects }) : compact };
         }
         if (options.command === "status") {
-          const report = await bb.storage.kv.get<ApplyReport>("last-run") ?? null;
+          const report = normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null);
           return { exitCode: 0, stdout: options.json ? JSON.stringify({ current: active, report }) : active ? JSON.stringify(active, null, 2) : report ? JSON.stringify(report, null, 2) : "No migration has run." };
         }
         if (options.command === "repair") {
@@ -649,7 +692,7 @@ export default async function plugin(bb: BbPluginApi) {
         }
         const report = await apply(options);
         const errors = report.projects.reduce((count, project) => count + project.failed.length + project.mismatches.length, 0);
-        const compact = report.projects.map((project) => `${project.name}: ${project.imported} imported, ${project.existing} existing, ${project.skippedEmpty} empty skipped, ${project.uploadedAttachments} attachments, ${project.failed.length} failed, ${project.mismatches.length} mismatches`).join("\n");
+        const compact = report.projects.map((project) => `${project.name}: ${project.imported} imported, ${project.partiallyImported.length} partially imported, ${project.existing} existing, ${project.skippedEmpty} empty skipped, ${project.uploadedAttachments} attachments, ${project.failed.length} failed, ${project.mismatches.length} mismatches`).join("\n");
         return { exitCode: errors ? 1 : 0, stdout: options.json ? JSON.stringify(report) : `${compact}\nBackup: ${report.backupPath ?? "not needed"}` };
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);

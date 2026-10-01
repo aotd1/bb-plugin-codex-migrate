@@ -19,6 +19,14 @@ export interface AttachmentResult {
   unresolved: string[];
 }
 
+function replaceUnavailable(part: Record<string, unknown>, candidate: string): void {
+  part.type = "text";
+  part.text = `[Attachment unavailable: ${candidate}]`;
+  part.mentions = [];
+  delete part.path;
+  delete part.url;
+}
+
 export async function attachHistory(
   bb: BbPluginApi,
   catalog: CodexCatalog,
@@ -83,11 +91,13 @@ export async function attachHistory(
       if (bytes === null) {
         if (type === "image" && /^https?:\/\//u.test(candidate)) continue;
         unresolved.push(`${sourceId}: ${type} ${candidate}`);
+        replaceUnavailable(part, candidate);
         continue;
       }
       const maxBytes = (isImage ? 10 : 25) * 1024 * 1024;
       if (bytes.byteLength > maxBytes) {
         unresolved.push(`${sourceId}: ${type} exceeds ${maxBytes} bytes`);
+        replaceUnavailable(part, candidate);
         continue;
       }
       try {
@@ -101,6 +111,7 @@ export async function attachHistory(
         uploaded++;
       } catch (cause) {
         unresolved.push(`${sourceId}: ${type} upload failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+        replaceUnavailable(part, candidate);
       }
     }
     event.data = JSON.stringify(data);

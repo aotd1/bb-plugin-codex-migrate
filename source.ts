@@ -50,6 +50,54 @@ interface ThreadRow {
   source: string;
 }
 
+function record(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function seconds(value: unknown, fallback: number | null): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function durationMs(value: unknown): number | null {
+  const duration = record(value);
+  const secs = typeof duration.secs === "number" ? duration.secs : 0;
+  const nanos = typeof duration.nanos === "number" ? duration.nanos : 0;
+  return secs || nanos ? Math.round(secs * 1000 + nanos / 1_000_000) : null;
+}
+
+function rolloutItem(value: unknown): Record<string, unknown> {
+  const item = record(value);
+  const type = typeof item.type === "string" ? item.type : "Unknown";
+  const id = typeof item.id === "string" ? item.id : `${type}-unknown`;
+  if (type === "UserMessage") return { type: "userMessage", id, clientId: item.client_id ?? null, content: Array.isArray(item.content) ? item.content : [] };
+  if (type === "AgentMessage") return { type: "agentMessage", id, text: item.content ?? "", phase: item.phase ?? null };
+  if (type === "Reasoning") return { type: "reasoning", id, summary: Array.isArray(item.summary_text) ? item.summary_text : [], content: Array.isArray(item.raw_content) ? item.raw_content : [] };
+  if (type === "Plan") return { type: "plan", id, text: item.text ?? "" };
+  if (type === "ContextCompaction") return { type: "contextCompaction", id };
+  if (type === "ImageView") return { type: "imageView", id, path: item.path ?? "" };
+  if (type === "CommandExecution") {
+    const command = Array.isArray(item.command) ? item.command.map(String).join(" ") : item.command ?? "";
+    const cwd = typeof item.cwd === "string" && item.cwd.startsWith("file://") ? item.cwd.slice("file://".length) : item.cwd ?? "";
+    return { type: "commandExecution", id, command, cwd, status: item.status ?? "completed",
+      aggregatedOutput: item.aggregated_output ?? "", exitCode: item.exit_code ?? null, durationMs: durationMs(item.duration) };
+  }
+  if (type === "FileChange") {
+    const changes = Object.entries(record(item.changes)).map(([path, raw]) => {
+      const change = record(raw);
+      return { path, kind: change.type ?? "update", movePath: change.move_path ?? undefined, diff: change.unified_diff ?? undefined };
+    });
+    return { type: "fileChange", id, changes, status: item.status ?? "completed" };
+  }
+  if (type === "McpToolCall") return {
+    type: "mcpToolCall", id, server: item.server ?? "mcp", tool: item.tool ?? "unknown",
+    arguments: record(item.arguments), status: item.status ?? "completed", result: item.result ?? null,
+    ...(item.error == null ? {} : { error: item.error }), durationMs: durationMs(item.duration),
+  };
+  return { ...item, type: type[0]!.toLowerCase() + type.slice(1), id };
+}
+
 export class CodexCatalog {
   readonly db: Database.Database;
   private historyDb: Database.Database | null = null;
@@ -91,15 +139,87 @@ export class CodexCatalog {
     return { id: threadId, createdAt: source.created_at, turns };
   }
 
+  async localThread(threadId: string): Promise<unknown> {
+    try { return this.projectedThread(threadId); }
+    catch (cause) {
+      if (!(cause instanceof Error) || ![
+        "Codex projected history database is missing",
+        "Codex projected history is incomplete",
+        "Codex projected history has no turns",
+      ].some((message) => cause.message.includes(message))) throw cause;
+      return this.rolloutThread(threadId);
+    }
+  }
+
+  async rolloutThread(threadId: string): Promise<unknown> {
+    const source = this.db.prepare("SELECT rollout_path,created_at FROM threads WHERE id=?").get(threadId) as { rollout_path: string; created_at: number } | undefined;
+    if (!source || !existsSync(source.rollout_path)) throw new Error(`Codex source rollout is missing for ${threadId}`);
+    const initialSize = statSync(source.rollout_path).size;
+    const turns: { id: string; status: string; startedAt: number | null; completedAt: number | null; items: Record<string, unknown>[] }[] = [];
+    const byId = new Map<string, typeof turns[number]>();
+    const itemIds = new Map<string, Set<string>>();
+    let lineNumber = 0;
+    const at = (value: unknown): number | null => {
+      const parsed = typeof value === "string" ? Date.parse(value) / 1000 : Number.NaN;
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+    const ensureTurn = (id: string, startedAt: number | null) => {
+      let turn = byId.get(id);
+      if (!turn) {
+        turn = { id, status: "inProgress", startedAt, completedAt: null, items: [] };
+        byId.set(id, turn);
+        itemIds.set(id, new Set());
+        turns.push(turn);
+      } else if (turn.startedAt === null && startedAt !== null) turn.startedAt = startedAt;
+      return turn;
+    };
+    const lines = createInterface({ input: createReadStream(source.rollout_path) });
+    for await (const line of lines) {
+      lineNumber++;
+      if (!line.trim()) continue;
+      let entry: Record<string, unknown>;
+      try { entry = record(JSON.parse(line)); }
+      catch { throw new Error(`Invalid Codex rollout JSON for ${threadId} at line ${lineNumber}`); }
+      if (entry.type !== "event_msg") continue;
+      const payload = record(entry.payload);
+      const turnId = typeof payload.turn_id === "string" ? payload.turn_id : null;
+      if (!turnId) continue;
+      const timestamp = at(entry.timestamp);
+      if (payload.type === "task_started") {
+        ensureTurn(turnId, seconds(payload.started_at, timestamp));
+      } else if (payload.type === "item_completed") {
+        const startedAt = typeof payload.started_at_ms === "number" ? payload.started_at_ms / 1000 : timestamp;
+        const turn = ensureTurn(turnId, startedAt);
+        const item = rolloutItem(payload.item);
+        const itemId = typeof item.id === "string" ? item.id : null;
+        if (!itemId || !itemIds.get(turnId)!.has(itemId)) {
+          turn.items.push(item);
+          if (itemId) itemIds.get(turnId)!.add(itemId);
+        }
+      } else if (payload.type === "task_complete" || payload.type === "turn_aborted") {
+        const turn = ensureTurn(turnId, seconds(payload.started_at, timestamp));
+        turn.status = payload.type === "task_complete" ? "completed" : "interrupted";
+        turn.completedAt = seconds(payload.completed_at, timestamp);
+      }
+    }
+    if (statSync(source.rollout_path).size !== initialSize) throw new Error(`Codex source rollout changed while reading ${threadId}`);
+    if (turns.length === 0) throw new Error(`Codex source rollout has no turns for ${threadId}`);
+    return { id: threadId, createdAt: source.created_at, turns };
+  }
+
   isEmptyPlaceholder(threadId: string): boolean {
     const row = this.db.prepare("SELECT title,rollout_path,has_user_event,tokens_used,first_user_message,preview,created_at,updated_at FROM threads WHERE id=?").get(threadId) as {
       title: string | null; rollout_path: string; has_user_event: number; tokens_used: number;
       first_user_message: string | null; preview: string | null; created_at: number; updated_at: number;
     } | undefined;
-    if (!row || existsSync(row.rollout_path) || row.title || row.has_user_event || row.tokens_used || row.first_user_message || row.preview || row.created_at !== row.updated_at) return false;
+    if (!row || row.title || row.has_user_event || row.tokens_used || row.first_user_message || row.preview || row.created_at !== row.updated_at) return false;
     const historyPath = join(this.home, "thread_history_1.sqlite");
     if (!existsSync(historyPath)) return false;
     const history = this.historyDb ??= new Database(historyPath, { readonly: true, fileMustExist: true });
+    if (existsSync(row.rollout_path)) {
+      const projection = history.prepare("SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id=?").get(threadId) as { next_rollout_byte_offset: number } | undefined;
+      if (!projection || projection.next_rollout_byte_offset < statSync(row.rollout_path).size) return false;
+    }
     for (const table of ["thread_turns", "thread_items"] as const) {
       const found = history.prepare(`SELECT 1 FROM ${table} WHERE thread_id=? LIMIT 1`).get(threadId);
       if (found) return false;
