@@ -15,7 +15,7 @@ The bundled BB Codex provider is not required; this plugin reads Codex data dire
 Install the released plugin from GitHub:
 
 ```sh
-bb plugin install git:https://github.com/aotd1/bb-plugin-codex-migrate.git@^0.3.12
+bb plugin install git:https://github.com/aotd1/bb-plugin-codex-migrate.git@^0.3.13
 ```
 
 To build and install a local checkout instead:
