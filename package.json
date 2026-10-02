@@ -7,11 +7,12 @@
   },
   "type": "module",
   "scripts": {
-    "test": "tsc -p tsconfig.test-build.json && node --test bb-store.test.mjs history.test.mjs routing.test.mjs server.test.mjs source.test.mjs"
+    "test": "tsc -p tsconfig.test-build.json && node --test external-history.test.mjs history.test.mjs routing.test.mjs server.test.mjs source.test.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "engines": {
     "bb": ">=0.44 <0.45",
-    "bbPluginSdk": ">=0.5.29"
+    "bbPluginSdk": ">=0.6.10"
   },
   "bb": {
     "name": "Codex Migrate",
@@ -31,7 +32,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "0.5.29",
+    "@get-bb/plugin-sdk": "file:vendor-sdk/get-bb-plugin-sdk-0.6.10.tgz",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",

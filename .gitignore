@@ -3,3 +3,5 @@ node_modules/
 .tmp-test/
 .DS_Store
 *.tgz
+
+!vendor-sdk/*.tgz

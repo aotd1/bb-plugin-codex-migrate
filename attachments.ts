@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { basename } from "node:path";
 import { readFile, stat } from "node:fs/promises";
 import type { BbPluginApi } from "@get-bb/plugin-sdk";
@@ -19,37 +20,46 @@ export interface AttachmentResult {
   unresolved: string[];
 }
 
-function replaceUnavailable(part: Record<string, unknown>, candidate: string): void {
-  part.type = "text";
-  part.text = `[Attachment unavailable: ${candidate}]`;
-  part.mentions = [];
-  delete part.path;
-  delete part.url;
-}
-
 export async function attachHistory(
   bb: BbPluginApi,
   catalog: CodexCatalog,
   projectId: string,
   sourceId: string,
   history: History,
+  existingAttachments = new Map<string, {type: "localImage" | "localFile"; path: string}[]>(),
 ): Promise<AttachmentResult> {
   const fromRollout = await catalog.imageDataUrls(sourceId);
   let embeddedByPath: Map<string, string> | null = null;
   let imageIndex = 0;
   let uploaded = 0;
   const unresolved: string[] = [];
-  for (const event of history.events) {
-    if (event.type !== "client/turn/requested") continue;
-    const data = JSON.parse(event.data) as { input?: Record<string, unknown>[] };
-    if (!Array.isArray(data.input)) continue;
-    for (const part of data.input) {
+  for (const pending of history.pendingAttachments) {
+    const item = pending.entry.item;
+    if (item.type !== "user") continue;
+    const attachments: NonNullable<typeof item.attachments> = [];
+    for (const [partIndex, part] of pending.parts.entries()) {
+      if (part.type !== "localFile") imageIndex++;
+      const label = part.candidate.startsWith("data:") || part.candidate.length > 4096
+        ? `attachment sha256:${createHash("sha256").update(part.candidate).digest("hex")}` : part.candidate;
+      const cacheKey = `upload:${createHash("sha256").update(JSON.stringify([projectId, sourceId, pending.key, partIndex, part])).digest("hex")}`;
+      const cached = await bb.storage.kv.get<{ type: "localImage" | "localFile"; path: string } | { unavailable: string }>(cacheKey);
+      if (cached) {
+        if ("path" in cached) attachments.push(cached);
+        else { item.text += `\n[Attachment unavailable: ${label}]`; unresolved.push(cached.unavailable); }
+        continue;
+      }
+      const unavailable = async (message: string) => {
+        unresolved.push(message);
+        item.text += `\n[Attachment unavailable: ${label}]`;
+        // Pin the first outcome, so a retry cannot change an immutable turn.
+        await bb.storage.kv.set(cacheKey, { unavailable: message });
+      };
       const type = part.type;
       if (type !== "localImage" && type !== "localFile" && type !== "image") continue;
       const isImage = type !== "localFile";
-      const candidate = type === "image" ? part.url : part.path;
+      const candidate = part.candidate;
       if (typeof candidate !== "string") continue;
-      const rolloutImage = isImage ? fromRollout[imageIndex++] : undefined;
+      const rolloutImage = isImage ? fromRollout[imageIndex - 1] : undefined;
       let bytes: Uint8Array | null = null;
       let mimeType: string | undefined;
       let filename = isImage ? `codex-image-${imageIndex}.png` : basename(candidate);
@@ -89,15 +99,22 @@ export async function attachHistory(
         }
       }
       if (bytes === null) {
-        if (type === "image" && /^https?:\/\//u.test(candidate)) continue;
-        unresolved.push(`${sourceId}: ${type} ${candidate}`);
-        replaceUnavailable(part, candidate);
+        await unavailable(`${sourceId}: ${type} ${label}`);
         continue;
       }
       const maxBytes = (isImage ? 10 : 25) * 1024 * 1024;
       if (bytes.byteLength > maxBytes) {
-        unresolved.push(`${sourceId}: ${type} exceeds ${maxBytes} bytes`);
-        replaceUnavailable(part, candidate);
+        await unavailable(`${sourceId}: ${type} exceeds ${maxBytes} bytes`);
+        continue;
+      }
+      const existing = existingAttachments.get(pending.key);
+      if (existing) {
+        const reference = existing[partIndex];
+        if (!reference || reference.type !== (isImage ? "localImage" : "localFile")) throw new Error("Legacy attachment count/type differs");
+        const saved = await bb.sdk.projects.attachments.read({ projectId, path: reference.path });
+        if (!Buffer.from(bytes).equals(Buffer.from(saved.bytes))) throw new Error("Legacy attachment bytes differ; adoption cannot replace ownership/content");
+        await bb.storage.kv.set(cacheKey, reference);
+        attachments.push(reference);
         continue;
       }
       try {
@@ -105,16 +122,16 @@ export async function attachHistory(
           projectId, clientFile: bytes, filename,
           ...(mimeType ? { mimeType } : {}),
         });
-        part.type = isImage ? "localImage" : "localFile";
-        part.path = result.path;
-        delete part.url;
+        const attachment = { type: isImage ? "localImage" as const : "localFile" as const, path: result.path };
+        await bb.storage.kv.set(cacheKey, attachment);
+        attachments.push(attachment);
         uploaded++;
       } catch (cause) {
-        unresolved.push(`${sourceId}: ${type} upload failed: ${cause instanceof Error ? cause.message : String(cause)}`);
-        replaceUnavailable(part, candidate);
+        await unavailable(`${sourceId}: ${type} upload failed: ${cause instanceof Error ? cause.message : String(cause)}`);
       }
     }
-    event.data = JSON.stringify(data);
+    if (attachments.length > 32) throw new Error(`${sourceId}: user attachments exceed 32`);
+    if (attachments.length) item.attachments = attachments;
   }
   return { uploaded, unresolved };
 }

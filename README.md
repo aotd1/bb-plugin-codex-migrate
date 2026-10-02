@@ -1,30 +1,26 @@
 # Codex Migrate for BB
 
-Imports local Codex projects and chat history into BB 0.44. Open **Codex migration** in the BB sidebar to preview and select folders. The **All** checkbox starts selected. A folder listed in several Codex projects has linked checkboxes and is imported only once. The All row and each folder show a progress bar and counts for the latest run: chats added in that run, partially imported because an attachment was unavailable, already in BB, and empty records skipped. The finished result remains visible when the page is reopened. The page also polls saved status every five seconds while open.
+Preview and import explicitly selected local Codex folders and conversations through BB's public external history API. The sidebar shows routing, existing matches, conversation checkboxes, content limitations and durable progress. Shared folder paths are selected together and imported once. Import and session binding never send a prompt or start a model.
 
-## Requirements
+## Requirements and local installation
 
-- BB 0.44 and the local Codex data on the same machine as the BB server. The plugin reads `CODEX_HOME/state_5.sqlite` when `CODEX_HOME` is set, otherwise `~/.codex/state_5.sqlite`.
-- A separately installed Codex CLI that supports `codex app-server`. Make `codex` available to the BB server on `PATH`, or set `CODEX_CLI` to its absolute executable path in the BB server environment.
-- Git on the BB server machine, used to identify repository roots and for the optional `git init` flow.
+This development branch requires BB 0.44.0 from `aotd1/bb` external-history-api, audited at commit `58ec5843077c8e060168911f0877d1220e41c05b`, with **runtime Plugin SDK >=0.6.10**. Vanilla BB with SDK 0.5.29 cannot run this version. SDK 0.6.10 of this fork is not published to npm: the dependency is pinned to the checked-in public package [vendor-sdk](vendor-sdk/README.md), with checksum and provenance. Do not replace it with npm `latest`, a private core import or a lower SDK floor.
 
-The bundled BB Codex provider is not required; this plugin reads Codex data directly. These tools are system prerequisites, not npm package dependencies. The plugin reports a missing Codex CLI when it first needs `codex app-server`.
+The BB server must run on the machine containing the selected Codex source, with its primary host identifying that machine. The importer reads `CODEX_HOME/state_5.sqlite` (or `~/.codex/state_5.sqlite`), projections and rollouts read-only. Install Git and a Codex CLI supporting `codex app-server`; use `CODEX_CLI` for an explicit executable path. A registered **Codex provider** and a ready same-project environment on the source host are required for interactive continuation, separately from reading Codex source history.
 
-## Install
-
-Install the released plugin from GitHub:
+This branch has not been released or published. Build the dedicated checkout:
 
 ```sh
-bb plugin install git:https://github.com/aotd1/bb-plugin-codex-migrate.git@^0.3.13
-```
-
-To build and install a local checkout instead:
-
-```sh
-npm install
+cd /Users/aotd/Documents/Projects/bb-plugin-codex-migrate-api
+npm ci
+npm run typecheck
+npm test
 bb plugin build
+# Install this checkout when you choose to replace the installed plugin:
 bb plugin install .
 ```
+
+The previous `v0.3.13` release uses the old adapter; it does not contain this API migration. No release tag or main-branch update is implied by these instructions.
 
 ## Use
 
@@ -32,28 +28,43 @@ bb plugin install .
 bb codex-migrate scan
 bb codex-migrate scan --project my-project --json
 bb codex-migrate scan --folder /path/to/repository --json
+bb codex-migrate apply --project my-project --thread SOURCE_SESSION_ID --json
+bb codex-migrate apply --folder /path/to/repository --limit 10
 bb codex-migrate apply --project my-project --existing-only
-bb codex-migrate apply --project another-project
-bb codex-migrate apply --folder /path/to/repository
 bb codex-migrate apply --project standalone-folder --init-git
 bb codex-migrate status --json
-bb codex-migrate repair --bb-project proj_example --json
+bb codex-migrate bind --bb-project proj_example --thread SOURCE_SESSION_ID --environment env_example
+bb codex-migrate release --bb-project proj_example --thread SOURCE_SESSION_ID
 ```
 
-`scan` without a selector lists projects. CLI `apply` requires `--project`, `--folder`, or an explicit `--all`; it never imports every project by default. Normal `apply` skips IDs already in BB; `--existing-only` verifies their message counts and archive state without adding chats. `--limit N` caps new chats in one run; rerun the same command to continue. Existing Codex source IDs are matched through BB's `thread/identity` events, so reruns do not duplicate them. `status` shows the active run, its last update, and the last completed report. If BB restarts during a run, the status becomes `interrupted`; repeat the same selection to continue.
+`apply` requires `--project`, `--folder`, or explicit `--all`. Optional repeated `--thread` IDs restrict conversations inside those folders; omitted thread IDs select all their conversations. The UI lets you deselect conversations after preview. `--existing-only` restricts the selection to bound or legacy candidate threads and performs API replay/adoption; it can append newly finalized history. `--limit N` caps new conversations. Existing IDs are always re-read and reconciled, so rerunning the same selection can finish a partial migration.
 
-Imported chat titles use Codex's chat name when present, falling back to its first-message title, and are shortened to 80 characters by default. In **Settings → Installed plugins → Codex Migrate**, set **Imported chat titles** to `original` to preserve the full title, or change **Maximum title length** (30–200). Shortening runs locally and does not send chat content to an AI service. The full source title stays in search. Changing the setting affects new imports; `bb codex-migrate repair --bb-project ID` applies it to existing chats when needed and replaces old first-message titles with Codex names. Repair also removes invalid `error: null` fields written by older importer versions, which prevented some timelines from loading. It creates a SQLite backup before changing BB and does not import new chats. The repair command accepts explicit `--project`, `--folder`, `--bb-project`, or `--all` selection. It preserves manually renamed titles.
+Folder routing is unchanged: Git subfolders and worktrees route to the main repository; independent nested repositories and submodules remain separate. Multi-root projects produce independent targets per repository. Matching projects are found through SDK sources on the source host. Ambiguous projects, duplicate session claims and conversations in another BB project conflict rather than being moved or duplicated. Standalone non-Git folders require the explicit `git init` choice; missing folders block the selected import.
 
-## Projects with several directories
+## History, retries and continuation
 
-Each selected Codex folder is resolved to its Git repository. A folder inside a repository routes to the parent repository's BB project; a nested independent repository or submodule routes to its own BB project. Chats from a Git worktree route to the main repository's BB project. A multi-folder Codex project is treated as several folder selections. Repeated folder paths share one selection state and are imported once. The importer reuses a BB project with the same repository path or creates one when needed.
+Completed turns preserve user/assistant text, plans, reasoning summary/content, tools, commands and file changes. Commands and file changes are historical descriptions and execute nothing. Source turn times are retained in milliseconds. If Codex omits item timestamps, item times are derived deterministically within the source turn; missing turn times use a deterministic creation-time fallback. Titles use the Codex chat name, falling back to the first message. Local title settings affect new imports only; the full source title is searchable up to the API's 4096-character limit. Displayed titles cap at 512 characters; exceeding these limits is reported. Existing manual titles and timestamps are not overwritten.
 
-A folder outside every Git repository shows a warning and a checked **Initialize Git and import this folder** checkbox in the preview. Clearing it skips that folder. The CLI requires `--init-git` to import standalone non-Git folders; this runs `git init` without creating a commit or remote. Missing folders and chats already imported into a different BB project block the affected import. Existing chats are never silently moved from a BB subfolder project to the parent repository project.
+Stable turn IDs/orders, semantic fingerprints and cached project-upload references exist before the first history write. Batches retain whole turns and respect **500 terminal items / 1 MiB UTF-8 JSON**, **100 items per turn**, **128000 characters per text**, and **32 user attachments**. Oversized turns/texts fail without splitting or truncating content. Exact replays skip; edited known IDs, shifted ordering or backfill behind the cursor conflict. Source compaction/truncated history is never an implicit generation reset. This importer does not perform automatic source resets.
 
-Before the first BB write, the importer creates a backup under BB's `plugins/codex-migrate/backups/`. Imported chats preserve their Codex archive state. Codex itself is not archived, unarchived, or deleted. An archived Codex session may need to be unarchived in Codex before continuing its BB copy.
+Each history request is atomic, but a multi-batch conversation or multi-conversation run is **not one transaction**. A failure can leave committed batches. Per-batch receipts, conversation fingerprints, upload results, run status and reports use plugin-owned SDK storage. After a lost response, rerun the same selection: replay includes the overlap and core deduplicates the committed IDs. Reloaded running status becomes `interrupted`; no automatic background import of user history occurs.
 
-## Compatibility
+User images/files are uploaded through `sdk.projects.attachments.upload`; core acquires ownership with the history batch. Missing temporary images can be recovered from source rollouts. Unavailable files and remote URLs become an explicit `[Attachment unavailable: …]` marker and a partial report. Upload outcomes are pinned for immutable retry semantics; later recovery cannot silently rewrite an already imported turn. Legacy attachment references are reused only after source bytes match a public attachment read.
 
-This first release uses a version-gated BB 0.44 SQLite adapter because BB's public Plugin SDK cannot yet import historical thread events. It checks the required schema and writes each thread in one transaction. Install it only on the declared BB version range. A future BB import API should replace `bb-store.ts`.
+New archived conversations import as passive history and are then archived through SDK. Already archived BB threads remain archived. Existing interactive threads are never automatically archived/released/unarchived. Active turns, queued work and inflight context changes are conflicts; the importer never interrupts them.
 
-The plugin imports text, timeline items, and available image and file attachments. If an old temporary image path is gone, it looks for the exact path and image bytes in the same Codex rollout, then in rollouts from the same source folder. If the bytes are no longer available, the rest of the chat is imported, the attachment becomes an `[Attachment unavailable: PATH]` text marker, and the report counts the chat as `partially imported`. A Codex `thread/read` call that hangs is stopped after 60 seconds; the importer uses Codex's local history projection only when it covers the complete source rollout. When paginated history rejects `thread/read`, the importer reconstructs the chat from the complete local rollout. A missing rollout is counted as empty only when Codex metadata and the local history index both confirm that the record has no content. The sidebar may need a refresh after imported threads are written because this adapter cannot emit BB's internal thread notifier.
+For unarchived conversations, the importer separately binds the original Codex resume handle to an unambiguous ready environment on the source host. Bind uses generation/session CAS and starts no runtime; a subsequent ordinary user send resumes that handle. Existing adopted interactive bindings keep their environment and provider/session identity. Exact BB-owned source turns are acknowledged with existing sequences rather than copied; ambiguous or mismatching reconciliation conflicts.
+
+**Current core gap:** public SDK has no standalone provisioning operation that creates a ready project checkout without a thread send/spawn. For a new project with no ready environment, history is saved passively and the report says `Codex continuation pending`. Core confirmed this gap in thread `thr_sbs4wm9872`. Once a suitable ready environment exists, the explicit `bind` command enables continuation. `release` requests a settled idle release; failures/retained active turns remain bound. Unarchive explicitly before bind/release if needed. Archived Codex sessions may also need to be unarchived in Codex before later continuation.
+
+## Legacy imports and content boundaries
+
+There is no BB database adapter, backup operation or repair command. BB projects, threads, identities, events, uploads, search and environment state are accessed only through public SDK/server contracts. `better-sqlite3` is used exclusively for the read-only Codex source and source-only test fixtures; plugin-owned storage is sanctioned by SDK.
+
+Legacy candidates are enumerated through paginated public lists and identity events, including archives. Content and canonical times are read through public events (**100 per page**) and verified before `adoptThreadId`/`existingSequence` acknowledgement. Core independently validates identity/content/time atomically. Safe matches preserve thread IDs, provider/session identities, titles, times, archives and attachment ownership. Archived adoption adds no events. Duplicate candidates, changed session identities, mismatches and invalid legacy rows conflict; the importer never selects an arbitrary first match or creates a replacement silently.
+
+Known old `toolCall.error:null` events cannot be repaired by external history import. They must remain an explicit conflict until core provides an appropriate public repair operation. The former CLI/RPC `repair` is removed. Normalizing nullable source tool errors for a new semantic import does not rewrite old BB events.
+
+Streaming, unfinished turns/items, approvals, provider extensions, compaction markers, web-search/image-view specialized items and unknown user content are outside the typed contract. Preview/report names them; a conversation with omissions or pending continuation is `partiallyImported`, not a complete migration. CLI returns nonzero for partial/failed/conflicting outcomes while retaining the report.
+
+See [API contract](docs/external-history-contract.md) and [verification](VERIFICATION.md) for implementation boundaries and checks.

@@ -4,5 +4,5 @@
     "noEmit": false,
     "outDir": ".tmp-test"
   },
-  "include": ["bb-store.ts", "history.ts", "source.ts", "server.ts", "attachments.ts"]
+  "include": ["external-history.ts", "history.ts", "source.ts", "server.ts", "attachments.ts"]
 }

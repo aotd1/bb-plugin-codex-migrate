@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { basename } from "node:path";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { BbStore } from "./bb-store.js";
+import { ExternalHistoryStore, sourceIdentity, fingerprint } from "./external-history.js";
 import { attachHistory } from "./attachments.js";
 import { convertHistory, newId } from "./history.js";
 import { CodexAppServer, CodexCatalog, type SourceProject, type SourceThread } from "./source.js";
@@ -24,7 +24,7 @@ const summarySchema = z.object({
     git: z.boolean(), exists: z.boolean(), targetPath: z.string().nullable(), candidates: z.number(),
     targetProjectId: z.string().nullable(), targetProjectName: z.string(), linkedProjects: z.array(z.string()) })),
   conflicts: z.array(conflictSchema),
-  threads: z.array(z.object({ id: z.string(), title: z.string(), cwd: z.string(), archived: z.boolean(), alreadyImported: z.boolean() })),
+  threads: z.array(z.object({ id: z.string(), title: z.string(), cwd: z.string(), archived: z.boolean(), alreadyImported: z.boolean(), limitations: z.array(z.string()) })),
 });
 const projectReportSchema = z.object({
   sourceId: z.string(), name: z.string(), targetProjectId: z.string(), targetProjectIds: z.array(z.string()), candidates: z.number(),
@@ -34,7 +34,7 @@ const projectReportSchema = z.object({
   mismatches: z.array(z.object({ sourceId: z.string(), field: z.string(), source: z.union([z.number(), z.boolean()]), target: z.union([z.number(), z.boolean()]) })),
 });
 const reportSchema = z.object({
-  startedAt: z.string(), completedAt: z.string(), backupPath: z.string().nullable(),
+  startedAt: z.string(), completedAt: z.string(),
   projects: z.array(projectReportSchema),
 });
 const projectProgressSchema = z.object({
@@ -59,31 +59,37 @@ export const rpcContract = defineRpcContract({
     output: z.object({ projects: z.array(summarySchema) }),
   },
   apply: {
-    input: z.object({ projects: z.array(z.string()), roots: z.array(z.string()).optional(), gitInitRoots: z.array(z.string()).optional(), all: z.literal(false), existingOnly: z.boolean(), limit: z.number().int().positive().nullable() }).strict(),
+    input: z.object({ projects: z.array(z.string()), roots: z.array(z.string()).optional(), gitInitRoots: z.array(z.string()).optional(), all: z.literal(false), existingOnly: z.boolean(), limit: z.number().int().positive().nullable(), threadIds: z.array(z.string()).optional() }).strict(),
     output: reportSchema,
   },
   start: {
-    input: z.object({ projects: z.array(z.string()), roots: z.array(z.string()).optional(), gitInitRoots: z.array(z.string()).optional(), all: z.literal(false), existingOnly: z.boolean(), limit: z.number().int().positive().nullable() }).strict(),
+    input: z.object({ projects: z.array(z.string()), roots: z.array(z.string()).optional(), gitInitRoots: z.array(z.string()).optional(), all: z.literal(false), existingOnly: z.boolean(), limit: z.number().int().positive().nullable(), threadIds: z.array(z.string()).optional() }).strict(),
     output: z.object({ runId: z.string() }),
   },
   status: { input: z.null(), output: z.object({ current: runStatusSchema.nullable(), report: reportSchema.nullable() }) },
-  lastRun: { input: z.null(), output: z.object({ report: reportSchema.nullable() }) },
-  repair: {
-    input: z.object({ projects: z.array(z.string()), roots: z.array(z.string()).optional(), bbProjectIds: z.array(z.string()).optional(), all: z.boolean() }).strict(),
-    output: z.object({ threads: z.number(), events: z.number(), titles: z.number(), backupPath: z.string().nullable() }),
+  bind: {
+    input: z.object({ projectId: z.string(), conversationId: z.string(), environmentId: z.string() }).strict(),
+    output: z.object({ threadId: z.string(), changed: z.boolean(), mode: z.enum(["passive", "interactive"]) }),
   },
+  release: {
+    input: z.object({ projectId: z.string(), conversationId: z.string() }).strict(),
+    output: z.object({ threadId: z.string(), changed: z.boolean(), mode: z.enum(["passive", "interactive"]) }),
+  },
+  lastRun: { input: z.null(), output: z.object({ report: reportSchema.nullable() }) },
 });
 
 interface Options {
-  command: "scan" | "apply" | "repair" | "status" | "help";
+  command: "scan" | "apply" | "status" | "bind" | "release" | "help";
   projects: string[];
-  bbProjectIds: string[];
   all: boolean;
   existingOnly: boolean;
   limit: number | null;
   roots: string[];
   gitInitRoots: string[];
   initGitAll: boolean;
+  threadIds: string[];
+  bbProjectId: string | null;
+  environmentId: string | null;
   json: boolean;
 }
 
@@ -102,16 +108,15 @@ interface ProjectReport {
   mismatches: { sourceId: string; field: string; source: number | boolean; target: number | boolean }[];
 }
 
-interface ApplyReport {
+export interface ApplyReport {
   startedAt: string;
   completedAt: string;
-  backupPath: string | null;
   projects: ProjectReport[];
 }
 
 function progressFromReport(report: ProjectReport, updatedAt: string): z.infer<typeof projectProgressSchema> {
   return {
-    sourceId: report.sourceId, name: report.name, state: report.partiallyImported.length > 0 ? "partial" : "completed",
+    sourceId: report.sourceId, name: report.name, state: report.failed.length > 0 ? "failed" : report.partiallyImported.length > 0 ? "partial" : "completed",
     processed: report.imported + report.partiallyImported.length + report.existing + report.skippedEmpty + report.failed.length,
     total: report.candidates, imported: report.imported, partiallyImported: report.partiallyImported.length, existing: report.existing,
     skippedEmpty: report.skippedEmpty, failed: report.failed.length,
@@ -146,8 +151,9 @@ function canUseLocalHistory(cause: unknown): cause is Error {
 }
 
 function conflictFor(thread: SourceThread, project: SourceProject, targetId: string | null,
-  catalog: CodexCatalog, store: BbStore, allProjects: SourceProject[], routeFor = folderRoute): z.infer<typeof conflictSchema> | null {
+  catalog: CodexCatalog, store: ExternalHistoryStore, allProjects: SourceProject[], routeFor = folderRoute): z.infer<typeof conflictSchema> | null {
   const existing = store.existing(thread.id);
+  if (existing?.conflict) return { sourceId: thread.id, title: thread.title, cwd: thread.cwd, reason: existing.conflict, owners: [], importedProjectId: existing.projectId };
   const owners = catalog.owners(thread, allProjects);
   const root = rootForThread(project, thread, routeFor);
   if (!root) return { sourceId: thread.id, title: thread.title, cwd: thread.cwd,
@@ -219,8 +225,8 @@ function select(catalog: CodexCatalog, names: string[], all: boolean, allowEmpty
 
 function parseArgs(argv: string[]): Options {
   const command = argv[0] ?? "help";
-  if (!["scan", "apply", "repair", "status", "help", "--help"].includes(command)) throw new Error(`Unknown command: ${command}`);
-  const options: Options = { command: command === "--help" ? "help" : command as Options["command"], projects: [], bbProjectIds: [], roots: [], gitInitRoots: [], initGitAll: false, all: false, existingOnly: false, limit: null, json: false };
+  if (!["scan", "apply", "status", "bind", "release", "help", "--help"].includes(command)) throw new Error(`Unknown command: ${command}`);
+  const options: Options = { command: command === "--help" ? "help" : command as Options["command"], projects: [], roots: [], gitInitRoots: [], threadIds: [], bbProjectId: null, environmentId: null, initGitAll: false, all: false, existingOnly: false, limit: null, json: false };
   for (let index = 1; index < argv.length; index++) {
     const arg = argv[index];
     if (arg === "--project") {
@@ -231,10 +237,14 @@ function parseArgs(argv: string[]): Options {
       const path = argv[++index];
       if (!path || path.startsWith("--")) throw new Error("--folder requires a Codex project folder path");
       options.roots.push(path);
-    } else if (arg === "--bb-project") {
+    } else if (arg === "--thread") {
       const id = argv[++index];
-      if (!id || !id.startsWith("proj_")) throw new Error("--bb-project requires a BB project ID");
-      options.bbProjectIds.push(id);
+      if (!id || id.startsWith("--")) throw new Error("--thread requires a source Codex session ID");
+      options.threadIds.push(id);
+    } else if (arg === "--bb-project" || arg === "--environment") {
+      const id = argv[++index];
+      if (!id || id.startsWith("--")) throw new Error(`${arg} requires an ID`);
+      if (arg === "--bb-project") options.bbProjectId = id; else options.environmentId = id;
     } else if (arg === "--all") options.all = true;
     else if (arg === "--init-git") options.initGitAll = true;
     else if (arg === "--claim-shared-paths") throw new Error("--claim-shared-paths is obsolete; shared folders are selected once by path");
@@ -249,8 +259,14 @@ function parseArgs(argv: string[]): Options {
   }
   if (options.all && (options.projects.length || options.roots.length)) throw new Error("--all cannot be combined with --project or --folder");
   if (options.projects.length && options.roots.length) throw new Error("--project cannot be combined with --folder");
-  if (options.bbProjectIds.length && (options.command !== "repair" || options.projects.length || options.roots.length || options.all)) throw new Error("--bb-project applies only to repair and cannot be combined with other selections");
-  if (options.command !== "apply" && (options.existingOnly || options.limit !== null || options.initGitAll)) throw new Error("--existing-only, --limit and --init-git apply only to apply");
+  if (options.command === "bind" || options.command === "release") {
+    if (!options.bbProjectId || options.threadIds.length !== 1 || options.projects.length || options.roots.length || options.all || options.existingOnly || options.limit !== null || options.initGitAll) throw new Error("bind/release require --bb-project ID and exactly one --thread SOURCE_SESSION_ID");
+    if (options.command === "bind" && !options.environmentId) throw new Error("bind requires --environment ID");
+    if (options.command === "release" && options.environmentId) throw new Error("release does not take --environment");
+    return options;
+  }
+  if (options.bbProjectId || options.environmentId) throw new Error("--bb-project/--environment apply only to bind/release");
+  if (options.command !== "apply" && (options.existingOnly || options.limit !== null || options.initGitAll || options.threadIds.length)) throw new Error("--existing-only, --limit and --init-git apply only to apply");
   if (options.command === "status" && (options.all || options.projects.length || options.roots.length)) throw new Error("status does not select projects or folders");
   return options;
 }
@@ -266,7 +282,6 @@ export default async function plugin(bb: BbPluginApi) {
   let heartbeat: ReturnType<typeof setInterval> | null = null;
   let statusWrite: Promise<void> = Promise.resolve();
   let active: RunStatus | null = normalizeStatus(await bb.storage.kv.get<RunStatus>("current-run") ?? null);
-  const dataDir = bb.server.experimental_dataDir;
   if (active && !Array.isArray(active.projectProgress)) {
     const priorReport = normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null);
     active = {
@@ -301,8 +316,10 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function scan(names: string[], roots: string[], all: boolean, includeThreads: boolean): Promise<ProjectSummary[]> {
     const catalog = new CodexCatalog();
-    const store = new BbStore(dataDir);
     try {
+      const hostId = (await bb.sdk.system.config()).primaryHostId;
+      if (!hostId) throw new Error("BB has no primary host");
+      const store = new ExternalHistoryStore(bb, hostId);
       const routeCache = new Map<string, FolderRoute>();
       const routeFor = (path: string) => {
         let route = routeCache.get(path);
@@ -315,8 +332,21 @@ export default async function plugin(bb: BbPluginApi) {
         ? allProjects.filter((project) => project.roots.some((root) => selectedKeys.has(routeFor(root).key)))
         : select(catalog, names, all, true);
       const targets = await bb.sdk.projects.list();
-      const hostId = (await bb.sdk.system.config()).primaryHostId;
+      await store.load(selected.flatMap(project => catalog.threads(project).map(thread => thread.id)), targets.map(project => project.id));
       const matches = (path: string | null) => path === null ? [] : targets.filter((candidate) => candidate.sources.some((source) => source.hostId === hostId && routeFor(source.path).key === path));
+      const limitations = new Map<string, string[]>();
+      const diagnostics = new Map<string, string>();
+      if (includeThreads) for (const project of selected) for (const thread of catalog.threads(project)) {
+        const root = rootForThread(project, thread, routeFor);
+        if (selectedKeys && (!root || !selectedKeys.has(routeFor(root).key))) continue;
+        if (limitations.has(thread.id)) continue;
+        try {
+          const history = convertHistory(await catalog.localThread(thread.id), thread);
+          try { await store.diagnoseLegacy(thread,history); }
+          catch (cause) { diagnostics.set(thread.id, `Legacy diagnostic conflict: ${cause instanceof Error ? cause.message : cause}`); }
+          limitations.set(thread.id, [...history.unsupported, ...(history.pendingAttachments.length ? ["Attachments will be checked and uploaded when applying"] : [])]);
+        } catch (cause) { limitations.set(thread.id, [`History preview unavailable: ${cause instanceof Error ? cause.message : cause}`]); }
+      }
       return selected.map((project) => {
         const projectRoots = selectedKeys ? project.roots.filter((root) => selectedKeys.has(routeFor(root).key)) : project.roots;
         const threads = catalog.threads(project).filter((thread) => {
@@ -327,7 +357,7 @@ export default async function plugin(bb: BbPluginApi) {
         const conflicts = includeThreads ? threads.map((thread) => {
           const root = rootForThread(project, thread, routeFor);
           const matching = root ? matches(routeFor(thread.cwd).targetPath ?? routeFor(root).targetPath) : [];
-          return conflictFor(thread, project, matching.length === 1 ? matching[0]!.id : null, catalog, store, allProjects, routeFor);
+          return conflictFor(thread, project, matching.length === 1 ? matching[0]!.id : null, catalog, store, allProjects, routeFor) ?? (diagnostics.has(thread.id) ? {sourceId:thread.id,title:thread.title,cwd:thread.cwd,reason:diagnostics.get(thread.id)!,owners:[],importedProjectId:store.existing(thread.id)?.projectId ?? null} : null);
         }).filter((item) => item !== null) : [];
         const firstTarget = projectRoots[0] ? matches(routeFor(projectRoots[0]).targetPath) : [];
         return {
@@ -347,48 +377,14 @@ export default async function plugin(bb: BbPluginApi) {
           conflicts,
           threads: includeThreads ? threads.map((thread, index) => ({
             id: thread.id, title: thread.title, cwd: thread.cwd, archived: thread.archived,
-            alreadyImported: existing[index] !== null,
+            alreadyImported: existing[index] !== null, limitations: limitations.get(thread.id) ?? [],
           })) : [],
         };
       });
-    } finally { store.close(); catalog.close(); }
+    } finally { catalog.close(); }
   }
 
-  async function repair(names: string[], roots: string[], bbProjectIds: string[], all: boolean) {
-    if (applying) throw new Error("Another Codex migration is already running");
-    if (!all && names.length === 0 && roots.length === 0 && bbProjectIds.length === 0) throw new Error("Select a project or folder explicitly");
-    if (all && (names.length || roots.length || bbProjectIds.length)) throw new Error("--all cannot be combined with project or folder selection");
-    if (bbProjectIds.length && (names.length || roots.length)) throw new Error("BB project selection cannot be combined with Codex project or folder selection");
-    applying = true;
-    const catalog = new CodexCatalog();
-    const store = new BbStore(dataDir, true);
-    try {
-      const selected = bbProjectIds.length ? catalog.projects() : select(catalog, names, all, Boolean(roots.length));
-      const keys = new Set(roots.map((root) => folderRoute(root).key));
-      const bbIds = new Set(bbProjectIds);
-      const candidates = new Map<string, SourceThread>();
-      for (const project of selected) {
-        for (const thread of catalog.threads(project)) {
-          const root = rootForThread(project, thread);
-          const existing = store.existing(thread.id);
-          if (root && existing && (bbIds.size ? bbIds.has(existing.projectId) : (!roots.length || keys.has(folderRoute(root).key)))) candidates.set(thread.id, thread);
-        }
-      }
-      const { titleMode, titleMaxLength } = await titleSettings.get();
-      // Back up before touching existing BB events or titles.
-      const backupPath = candidates.size ? await store.backup(dataDir) : null;
-      let events = 0;
-      let titles = 0;
-      for (const thread of candidates.values()) {
-        const fixed = store.repairImportedThread(thread, titleMode as TitleMode, titleMaxLength);
-        events += fixed.events;
-        if (fixed.title) titles++;
-      }
-      return { threads: candidates.size, events, titles, backupPath };
-    } finally { store.close(); catalog.close(); applying = false; }
-  }
-
-  async function apply(options: Pick<Options, "projects" | "all" | "existingOnly" | "limit"> & Partial<Pick<Options, "roots" | "gitInitRoots" | "initGitAll">>, runId = newId("run")): Promise<ApplyReport> {
+  async function apply(options: Pick<Options, "projects" | "all" | "existingOnly" | "limit"> & Partial<Pick<Options, "roots" | "gitInitRoots" | "initGitAll" | "threadIds">>, runId = newId("run")): Promise<ApplyReport> {
     if (applying) throw new Error("Another Codex migration is already running");
     applying = true;
     const startedAt = new Date().toISOString();
@@ -404,10 +400,8 @@ export default async function plugin(bb: BbPluginApi) {
       processed: 0, total: 0, imported: 0, partiallyImported: 0, existing: 0, skippedEmpty: 0, failed: 0, error: null,
     };
     let catalog: CodexCatalog | null = null;
-    let store: BbStore | null = null;
     let source: CodexAppServer | null = null;
     const reports: ProjectReport[] = [];
-    let backupPath: string | null = null;
     const updateProject = (sourceId: string, fields: Partial<z.infer<typeof projectProgressSchema>>) => {
       const updatedAt = new Date().toISOString();
       progress = { ...progress, updatedAt,
@@ -440,8 +434,11 @@ export default async function plugin(bb: BbPluginApi) {
       const allowedKeys = new Set(allProjects.flatMap((project) => project.roots.map((root) => routeFor(root).key)));
       for (const key of selectedKeys) if (!allowedKeys.has(key)) throw new Error(`Unknown Codex project folder: ${key}`);
       for (const key of gitInitRoots) if (!selectedKeys.has(key) || routeFor(key).kind !== "non-git") throw new Error(`Cannot initialize Git for unselected or Git-backed folder: ${key}`);
-      const activeStore = new BbStore(dataDir, true);
-      store = activeStore;
+      const hostId = (await bb.sdk.system.config()).primaryHostId;
+      if (!hostId) throw new Error("BB has no primary host");
+      const activeStore = new ExternalHistoryStore(bb, hostId);
+      const existingTargets = await bb.sdk.projects.list();
+      await activeStore.load(selected.flatMap(project => openedCatalog.threads(project).map(thread => thread.id)), existingTargets.map(project => project.id));
       const folders = new Map<string, { key: string; root: string; route: FolderRoute; project: SourceProject; candidates: Map<string, SourceThread> }>();
       for (const project of selected) for (const root of project.roots) {
         const route = routeFor(root);
@@ -457,9 +454,13 @@ export default async function plugin(bb: BbPluginApi) {
         const folder = folders.get(routeFor(root).key);
         if (folder) folder.candidates.set(thread.id, thread);
       }
+      const requestedThreads = new Set(options.threadIds ?? []);
+      const availableThreads = new Set([...folders.values()].flatMap(folder => [...folder.candidates.keys()]));
+      for (const id of requestedThreads) if (!availableThreads.has(id)) throw new Error(`Source thread ${id} is outside selected folders`);
       const seenThreads = new Set<string>();
       const plans = [...folders.values()].sort((a, b) => b.root.length - a.root.length).map((folder) => {
         const candidates = [...folder.candidates.values()].filter((thread) => {
+          if (requestedThreads.size && !requestedThreads.has(thread.id)) return false;
           if (seenThreads.has(thread.id)) return false;
           seenThreads.add(thread.id);
           return !options.existingOnly || activeStore.existing(thread.id) !== null;
@@ -467,9 +468,6 @@ export default async function plugin(bb: BbPluginApi) {
         return { ...folder, candidates };
       }).filter((folder) => folder.route.kind !== "non-git" || options.initGitAll || gitInitRoots.includes(folder.key));
       if (plans.length === 0) throw new Error("No importable folders selected. For a standalone folder without Git, enable git init.");
-      const hostId = (await bb.sdk.system.config()).primaryHostId;
-      if (hostId === null) throw new Error("BB has no primary host");
-      const existingTargets = await bb.sdk.projects.list();
       progress = {
         ...progress,
         total: plans.reduce((sum, plan) => sum + plan.candidates.length, 0),
@@ -490,6 +488,7 @@ export default async function plugin(bb: BbPluginApi) {
           const threadRoute = routeFor(thread.cwd);
           if (threadRoute.exists && threadRoute.targetPath !== route.targetPath) throw new Error(`Chat ${thread.id} belongs to another Git repository: ${thread.cwd}`);
           const existing = activeStore.existing(thread.id);
+          if (existing?.conflict) throw new Error(existing.conflict);
           if (existing && existing.projectId !== matching[0]?.id) throw new Error(`Chat ${thread.id} is already in another BB project: ${existing.projectId}. Resolve this before import.`);
         }
       }
@@ -513,7 +512,6 @@ export default async function plugin(bb: BbPluginApi) {
           if (matching.length > 1) throw new Error(`Several BB projects use ${targetPath}; choose one before migration`);
           let bbProject = matching[0];
           if (!bbProject) {
-            if (backupPath === null) backupPath = await activeStore.backup(dataDir);
             bbProject = await bb.sdk.projects.create({ name: suggestedName(allProjects, route, routeFor), source: { type: "local_path", hostId, path: targetPath } });
           }
           target = { id: bbProject.id, name: bbProject.name };
@@ -534,10 +532,6 @@ export default async function plugin(bb: BbPluginApi) {
           updateProject(key, { currentThread: thread.title || thread.id });
           await updateStatus(progress);
           try {
-            if (existing && !options.existingOnly) {
-              report.existing++;
-              continue;
-            }
             if (source === null) {
               source = new CodexAppServer();
               await source.ready;
@@ -557,33 +551,25 @@ export default async function plugin(bb: BbPluginApi) {
             }
             const history = convertHistory(rawHistory, thread);
             if (disposed) throw new Error("Migration interrupted by plugin reload");
-            if (existing) {
-              if (existing.projectId !== target.id) throw new Error(`Already imported into another BB project: ${existing.projectId}`);
-              report.existing++;
-              for (const [field, sourceValue, targetValue] of [
-                ["userMessages", history.userMessages, existing.userMessages],
-                ["assistantMessages", history.assistantMessages, existing.assistantMessages],
-              ] as const) if (targetValue < sourceValue) report.mismatches.push({ sourceId: thread.id, field, source: sourceValue, target: targetValue });
-              if (thread.archived !== existing.archived && existing.userMessages === history.userMessages && existing.assistantMessages === history.assistantMessages) {
-                report.mismatches.push({ sourceId: thread.id, field: "archived", source: thread.archived, target: existing.archived });
-              }
-              continue;
-            }
-            if (history.userMessages === 0 && history.assistantMessages === 0) {
+            if (history.turns.length === 0 && history.unsupported.length === 0) {
               report.skippedEmpty++;
               continue;
             }
-            const attachments = await attachHistory(bb, openedCatalog, target.id, thread.id, history);
-            if (backupPath === null) backupPath = await activeStore.backup(dataDir);
-            activeStore.importThread({ projectId: target.id, hostId, projectRoot: targetPath, source: thread, history,
-              titleMode: titleMode as TitleMode, titleMaxLength });
-            if (attachments.unresolved.length > 0) {
-              report.partiallyImported.push({ sourceId: thread.id, message: `Unavailable attachments: ${attachments.unresolved.join("; ")}` });
-            } else {
-              report.imported++;
-            }
+            const references = await activeStore.attachmentReferences(thread, history);
+            const attachments = await attachHistory(bb, openedCatalog, target.id, thread.id, history, references);
+            const result = await activeStore.importThread({ projectId: target.id, projectRoot: targetPath, source: thread, history,
+              titleMode: titleMode as TitleMode, titleMaxLength,
+              onBatch: async (inserted, skipped) => {
+                if (disposed) throw new Error("Migration interrupted by plugin reload");
+                await bb.storage.kv.set(`conversation-progress:${fingerprint([sourceIdentity(hostId),target!.id,thread.id])}`, { inserted, skipped, updatedAt: new Date().toISOString() });
+                await updateStatus({ ...progress, updatedAt: new Date().toISOString() });
+              } });
+            const limitations = [...result.limitations, ...attachments.unresolved.map(message => `Unavailable attachment: ${message}`)];
+            if (limitations.length > 0) report.partiallyImported.push({ sourceId: thread.id, message: limitations.join("; ") });
+            else if (existing && (!existing.binding || result.inserted === 0)) report.existing++;
+            else report.imported++;
             report.uploadedAttachments += attachments.uploaded;
-            remaining--;
+            if (!existing) remaining--;
           } catch (cause) {
             if (cause instanceof Error && cause.message.includes("timed out after 60 seconds")) {
               source?.close();
@@ -616,11 +602,11 @@ export default async function plugin(bb: BbPluginApi) {
           }
         }
         const handled = report.imported + report.partiallyImported.length + report.existing + report.skippedEmpty + report.failed.length;
-        updateProject(key, { state: report.partiallyImported.length > 0 || handled < candidates.length ? "partial" : "completed", currentThread: null });
+        updateProject(key, { state: report.failed.length > 0 ? "failed" : report.partiallyImported.length > 0 || handled < candidates.length ? "partial" : "completed", currentThread: null });
         progress = { ...progress, currentThread: null };
         await updateStatus(progress);
       }
-      const result: ApplyReport = { startedAt, completedAt: new Date().toISOString(), backupPath, projects: reports };
+      const result: ApplyReport = { startedAt, completedAt: new Date().toISOString(), projects: reports };
       await bb.storage.kv.set("last-run", result);
       progress = { ...progress, state: "completed", currentProject: null, currentThread: null, completedAt: result.completedAt, updatedAt: result.completedAt,
         projectProgress: progress.projectProgress.map((project) => project.state === "queued" ? { ...project, state: "completed", updatedAt: result.completedAt } : project) };
@@ -635,9 +621,23 @@ export default async function plugin(bb: BbPluginApi) {
           ...project, state: progress.currentProject === null || project.sourceId === progress.currentProject ? "failed" : "interrupted",
           updatedAt: completedAt, currentThread: null, error,
         }) };
+      await bb.storage.kv.set("last-run", { startedAt, completedAt, projects: reports });
       await updateStatus(progress);
       throw cause;
-    } finally { if (heartbeat) clearInterval(heartbeat); heartbeat = null; source?.close(); store?.close(); catalog?.close(); applying = false; }
+    } finally { if (heartbeat) clearInterval(heartbeat); heartbeat = null; source?.close(); catalog?.close(); applying = false; }
+  }
+
+  async function session(projectId: string, conversationId: string, environmentId?: string) {
+    if (applying) throw new Error("Migration is running; wait before changing the session");
+    const hostId = (await bb.sdk.system.config()).primaryHostId;
+    if (!hostId) throw new Error("BB has no primary host");
+    const { binding } = await bb.sdk.threads.experimental_findExternalThread({projectId,conversationId,sourceId:sourceIdentity(hostId)});
+    if (!binding || binding.providerId !== "codex" || binding.sessionId !== conversationId) throw new Error("Matching Codex external binding not found");
+    const expected = {threadId:binding.threadId,expectedGeneration:binding.generation,expectedSessionId:binding.sessionId};
+    if (!environmentId) return bb.sdk.threads.experimental_releaseExternalSession(expected);
+    const environment = await bb.sdk.environments.get({environmentId});
+    if (environment.projectId !== projectId || environment.hostId !== hostId || environment.status !== "ready" || environment.lifecycle.teardown !== null || !["active", "retiring"].includes(environment.lifecycle.phase)) throw new Error("Bind requires a ready environment in this project on the source host");
+    return bb.sdk.threads.experimental_bindExternalSession({...expected,environmentId,providerId:"codex",providerThreadId:conversationId});
   }
 
   bb.rpc.register(rpcContract, {
@@ -652,16 +652,18 @@ export default async function plugin(bb: BbPluginApi) {
       return { runId };
     },
     status: async () => ({ current: active, report: normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null) }),
+    bind: async ({projectId,conversationId,environmentId}) => session(projectId,conversationId,environmentId),
+    release: async ({projectId,conversationId}) => session(projectId,conversationId),
     lastRun: async () => ({ report: normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null) }),
-    repair: async ({ projects, roots, bbProjectIds, all }) => repair(projects, roots ?? [], bbProjectIds ?? [], all),
   });
 
   const usage = [
     "Usage:",
     "  bb codex-migrate scan [--project NAME ... | --folder PATH ... | --all] [--json]",
-    "  bb codex-migrate apply (--project NAME ... | --folder PATH ... | --all) [--existing-only] [--limit N] [--init-git] [--json]",
+    "  bb codex-migrate apply (--project NAME ... | --folder PATH ... | --all) [--thread ID ...] [--existing-only] [--limit N] [--init-git] [--json]",
     "  bb codex-migrate status [--json]",
-    "  bb codex-migrate repair (--project NAME ... | --folder PATH ... | --bb-project ID ... | --all) [--json]",
+    "  bb codex-migrate bind --bb-project ID --thread SOURCE_SESSION_ID --environment ID [--json]",
+    "  bb codex-migrate release --bb-project ID --thread SOURCE_SESSION_ID [--json]",
     "No folder is imported unless --project, --folder or --all is explicitly supplied to apply.",
   ].join("\n");
   bb.cli.register({
@@ -669,14 +671,19 @@ export default async function plugin(bb: BbPluginApi) {
     summary: "Preview and import explicitly selected Codex projects and chats",
     commands: [
       { name: "scan", summary: "Read-only preview", usage: "bb codex-migrate scan [--project NAME ... | --folder PATH ... | --all] [--json]" },
-      { name: "apply", summary: "Import explicitly selected folders", usage: "bb codex-migrate apply (--project NAME ... | --folder PATH ... | --all) [--existing-only] [--limit N] [--init-git] [--json]" },
+      { name: "apply", summary: "Import explicitly selected folders", usage: "bb codex-migrate apply (--project NAME ... | --folder PATH ... | --all) [--thread ID ...] [--existing-only] [--limit N] [--init-git] [--json]" },
+      { name: "bind", summary: "Bind a ready environment to the original Codex session without starting a turn", usage: "bb codex-migrate bind --bb-project ID --thread SOURCE_SESSION_ID --environment ID [--json]" },
+      { name: "release", summary: "Release a settled Codex session without interrupting active work", usage: "bb codex-migrate release --bb-project ID --thread SOURCE_SESSION_ID [--json]" },
       { name: "status", summary: "Show current progress and last report", usage: "bb codex-migrate status [--json]" },
-      { name: "repair", summary: "Repair imported chats and apply the title setting", usage: "bb codex-migrate repair (--project NAME ... | --folder PATH ... | --bb-project ID ... | --all) [--json]" },
     ],
     async run(argv) {
       try {
         const options = parseArgs(argv);
         if (options.command === "help") return { exitCode: 0, stdout: usage };
+        if (options.command === "bind" || options.command === "release") {
+          const result = await session(options.bbProjectId!,options.threadIds[0]!,options.environmentId ?? undefined);
+          return {exitCode:0,stdout:JSON.stringify(result)};
+        }
         if (options.command === "scan") {
           const projects = await scan(options.projects, options.roots, options.all, options.projects.length > 0 || options.roots.length > 0 || options.all);
           const compact = projects.map((project) => `${project.name}: ${project.candidates} chats, ${project.alreadyImported} in BB, ${project.archived} archived`).join("\n");
@@ -686,14 +693,10 @@ export default async function plugin(bb: BbPluginApi) {
           const report = normalizeReport(await bb.storage.kv.get<ApplyReport>("last-run") ?? null);
           return { exitCode: 0, stdout: options.json ? JSON.stringify({ current: active, report }) : active ? JSON.stringify(active, null, 2) : report ? JSON.stringify(report, null, 2) : "No migration has run." };
         }
-        if (options.command === "repair") {
-          const report = await repair(options.projects, options.roots, options.bbProjectIds, options.all);
-          return { exitCode: 0, stdout: options.json ? JSON.stringify(report) : `${report.threads} chats checked; ${report.events} events repaired; ${report.titles} titles shortened. Backup: ${report.backupPath ?? "not needed"}` };
-        }
         const report = await apply(options);
-        const errors = report.projects.reduce((count, project) => count + project.failed.length + project.mismatches.length, 0);
+        const errors = report.projects.reduce((count, project) => count + project.failed.length + project.partiallyImported.length + project.mismatches.length, 0);
         const compact = report.projects.map((project) => `${project.name}: ${project.imported} imported, ${project.partiallyImported.length} partially imported, ${project.existing} existing, ${project.skippedEmpty} empty skipped, ${project.uploadedAttachments} attachments, ${project.failed.length} failed, ${project.mismatches.length} mismatches`).join("\n");
-        return { exitCode: errors ? 1 : 0, stdout: options.json ? JSON.stringify(report) : `${compact}\nBackup: ${report.backupPath ?? "not needed"}` };
+        return { exitCode: errors ? 1 : 0, stdout: options.json ? JSON.stringify(report) : compact };
       } catch (cause) {
         const message = cause instanceof Error ? cause.message : String(cause);
         return { exitCode: 1, stderr: `${message}\n${usage}` };

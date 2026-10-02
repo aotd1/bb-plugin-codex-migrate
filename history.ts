@@ -1,195 +1,106 @@
 import { randomBytes } from "node:crypto";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import type { SourceThread } from "./source.js";
 
-const itemSchema = z.record(z.string(), z.unknown());
-const turnSchema = z.object({
-  id: z.string(),
-  startedAt: z.number().nullable().optional(),
-  completedAt: z.number().nullable().optional(),
-  status: z.string().optional(),
-  items: z.array(itemSchema).optional(),
-}).passthrough();
-const threadSchema = z.object({
-  id: z.string(),
-  createdAt: z.number().optional(),
-  turns: z.array(turnSchema).optional(),
-}).passthrough();
-
-export interface ImportEvent {
-  id: string;
-  sequence: number;
-  scopeKind: "thread" | "turn";
-  turnId: string | null;
-  providerThreadId: string | null;
-  type: string;
-  itemId: string | null;
-  itemKind: string | null;
-  data: string;
-  createdAt: number;
-}
-
+export type ImportBatch = Parameters<BbPluginApi["sdk"]["threads"]["experimental_importHistory"]>[0];
+export type HistoryTurn = NonNullable<ImportBatch["turns"]>[number];
+export type HistoryItem = HistoryTurn["items"][number]["item"];
+export interface PendingAttachment { type: "localImage" | "localFile" | "image"; candidate: string }
 export interface History {
-  events: ImportEvent[];
+  turns: HistoryTurn[];
+  pendingAttachments: { entry: HistoryTurn["items"][number]; parts: PendingAttachment[]; key: string }[];
+  unsupported: string[];
   userMessages: number;
   assistantMessages: number;
   images: number;
 }
-
 export function newId(prefix: string): string {
-  const alphabet = "23456789abcdefghijkmnpqrstuvwxyz";
-  const random = randomBytes(16);
-  let suffix = "";
-  for (let index = 0; index < 10; index++) suffix += alphabet[random[index]! % alphabet.length];
-  return `${prefix}_${suffix}`;
+  return `${prefix}_${randomBytes(10).toString("hex")}`;
 }
-
-function string(value: unknown, fallback = ""): string {
-  return typeof value === "string" ? value : fallback;
+const record = (x: unknown): Record<string, unknown> => x !== null && typeof x === "object" && !Array.isArray(x) ? x as Record<string, unknown> : {};
+const list = (x: unknown): unknown[] => Array.isArray(x) ? x : [];
+const str = (x: unknown): string => typeof x === "string" ? x : "";
+function terminal(x: unknown): "completed" | "failed" | "interrupted" {
+  if (x === undefined || x === null) return "completed";
+  if (x === "completed" || x === "failed" || x === "interrupted") return x;
+  throw new Error(`Nonterminal status: ${String(x)}`);
 }
-
-function object(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
+function time(x: unknown, fallback: number): number {
+  const value = typeof x === "number" ? Math.floor(x * 1000) : fallback;
+  if (!Number.isSafeInteger(value) || value < 0 || value > 8_640_000_000_000_000) throw new Error("Invalid source timestamp");
+  return value;
 }
-
-function array(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
-
-function status(value: unknown): string {
-  return ["pending", "completed", "failed", "interrupted"].includes(value as string)
-    ? value as string
-    : "completed";
-}
-
-function normalizeUserContent(value: unknown): { parts: Record<string, unknown>[]; images: number } {
-  const parts: Record<string, unknown>[] = [];
-  let images = 0;
-  for (const raw of array(value)) {
-    const part = object(raw);
-    const type = string(part.type);
-    if (type === "text") parts.push({ type: "text", text: string(part.text), mentions: [] });
-    else if ((type === "localImage" || type === "localFile") && typeof part.path === "string") {
-      parts.push({ type, path: part.path });
-      if (type === "localImage") images++;
-    } else if (type === "image" && typeof part.url === "string") {
-      parts.push({ type: "image", url: part.url });
-      images++;
-    }
-  }
-  return { parts, images };
-}
-
-function normalizeItem(item: Record<string, unknown>): Record<string, unknown> {
-  const kind = string(item.type);
-  const id = string(item.id, newId("legacy_item"));
-  if (kind === "agentMessage") return { type: kind, id, text: string(item.text) };
-  if (kind === "reasoning") return { type: kind, id, summary: array(item.summary), content: [] };
-  if (kind === "plan") return { type: kind, id, text: string(item.text) };
-  if (kind === "contextCompaction") return { type: kind, id };
-  if (kind === "imageView") return { type: kind, id, path: string(item.path) };
-  if (kind === "webSearch") {
-    const action = object(item.action);
-    const queries = array(action.queries).filter((query) => typeof query === "string");
-    if (queries.length === 0) queries.push(string(action.query, string(item.query, "Web search")));
-    return { type: kind, id, queries, resultText: item.results == null ? null : JSON.stringify(item.results) };
-  }
-  if (kind === "mcpToolCall") return {
-    type: "toolCall", id, server: string(item.server, "mcp"), tool: string(item.tool, "unknown"),
-    arguments: object(item.arguments), status: status(item.status), result: item.result ?? null,
-    ...(item.error == null ? {} : { error: string(item.error, JSON.stringify(item.error)) }),
-    durationMs: typeof item.durationMs === "number" ? item.durationMs : null,
-  };
-  if (kind === "functionCallOutput") return {
-    type: "toolCall", id, server: string(item.namespace, "codex"),
-    tool: string(item.name, "functionCallOutput"), status: "completed", result: item.output ?? null,
-  };
-  if (kind === "commandExecution") return {
-    type: kind, id, command: string(item.command), cwd: string(item.cwd),
-    status: status(item.status), approvalStatus: null, aggregatedOutput: string(item.aggregatedOutput),
-    exitCode: typeof item.exitCode === "number" ? item.exitCode : null,
-    durationMs: typeof item.durationMs === "number" ? item.durationMs : null,
-  };
-  if (kind === "fileChange") return {
-    type: kind, id,
-    changes: array(item.changes).map((raw) => {
-      const change = object(raw);
-      const rawKind = change.kind;
-      const changeKind = typeof rawKind === "string" ? rawKind : string(object(rawKind).type, "update");
-      return {
-        path: string(change.path),
-        kind: ["add", "delete", "update"].includes(changeKind) ? changeKind : "update",
-        ...(typeof change.movePath === "string" ? { movePath: change.movePath } : {}),
-        ...(typeof change.diff === "string" ? { diff: change.diff } : {}),
-      };
-    }),
-    status: status(item.status), approvalStatus: null,
-  };
-  return { type: "toolCall", id, server: "codex-import", tool: kind || "unknown", status: "completed", result: item };
-}
-
 export function convertHistory(raw: unknown, meta: SourceThread): History {
-  const source = threadSchema.parse(raw);
+  const source = z.object({ id: z.string(), turns: z.array(z.object({ id: z.string(), startedAt: z.number().nullable().optional(), completedAt: z.number().nullable().optional(), status: z.string().optional(), items: z.array(z.record(z.string(), z.unknown())).optional() }).passthrough()).optional() }).passthrough().parse(raw);
   if (source.id !== meta.id) throw new Error(`Codex thread identity mismatch for ${meta.id}`);
-  const events: ImportEvent[] = [];
-  let sequence = 0;
-  let users = 0;
-  let assistants = 0;
-  let images = 0;
-  const add = (type: string, data: Record<string, unknown>, createdAt: number, turnId: string | null = null, item: Record<string, unknown> | null = null) => {
-    events.push({
-      id: newId("evt"), sequence: ++sequence, scopeKind: turnId ? "turn" : "thread", turnId,
-      providerThreadId: type === "client/turn/requested" || type === "thread/started" ? null : meta.id,
-      type, itemId: item ? string(item.id) : null, itemKind: item ? string(item.type) : null,
-      data: JSON.stringify(data), createdAt: Math.floor(createdAt),
-    });
-  };
-  const created = meta.createdAtMs || Math.floor((source.createdAt ?? 0) * 1000);
-  add("thread/started", {}, created);
-  add("thread/identity", { providerThreadId: meta.id }, created + 1);
-  let previousEnd = created + 2;
-  for (const turn of source.turns ?? []) {
-    const turnId = turn.id;
-    let start = turn.startedAt ? Math.floor(turn.startedAt * 1000) : previousEnd + 1;
-    let end = turn.completedAt ? Math.floor(turn.completedAt * 1000) : start + Math.max(1000, (turn.items ?? []).length * 2);
-    start = Math.max(start, previousEnd + 1);
-    end = Math.max(end, start + (turn.items ?? []).length + 3);
-    const items = turn.items ?? [];
-    const firstUser = items[0]?.type === "userMessage";
-    if (!firstUser) add("turn/started", { providerThreadId: meta.id }, start, turnId);
-    let userInTurn = 0;
-    for (let index = 0; index < items.length; index++) {
-      const item = items[index]!;
-      const at = start + 1 + index * Math.max(1, Math.floor((end - start - 2) / Math.max(1, items.length)));
-      if (item.type === "userMessage") {
-        users++;
-        userInTurn++;
-        const requestId = newId("creq");
-        const content = normalizeUserContent(item.content);
-        images += content.images;
-        add("client/turn/requested", {
-          direction: "outbound", source: "tell", initiator: "user",
-          request: { method: "turn/start", params: {} }, requestId, senderThreadId: null,
-          input: content.parts,
-          target: userInTurn === 1 ? { kind: "new-turn" } : { kind: "steer", expectedTurnId: turnId },
-          execution: {
-            model: meta.model ?? "gpt-6-astra", permissionMode: "auto",
-            reasoningLevel: meta.reasoningEffort ?? "medium", serviceTier: "default",
-            source: "client/turn/requested",
-          },
-        }, at);
-        if (firstUser && index === 0) add("turn/started", { providerThreadId: meta.id }, at + 1, turnId);
-        add("turn/input/accepted", { providerThreadId: meta.id, clientRequestId: requestId }, at + 2, turnId);
-      } else {
-        const normalized = normalizeItem(item);
-        if (normalized.type === "agentMessage") assistants++;
-        add("item/completed", { providerThreadId: meta.id, item: normalized }, at, turnId, normalized);
+  const history: History = { turns: [], pendingAttachments: [], unsupported: [], userMessages: 0, assistantMessages: 0, images: 0 };
+  const ids = new Set<string>();
+  for (const [turnIndex, turn] of (source.turns ?? []).entries()) {
+    if (ids.has(turn.id)) throw new Error(`Duplicate source turn ID: ${turn.id}`);
+    ids.add(turn.id);
+    let state: HistoryTurn["status"];
+    try { state = terminal(turn.status); } catch { history.unsupported.push(`${turn.id}: unfinished turn; later turns deferred to preserve append order`); break; }
+    const start = time(turn.startedAt, meta.createdAtMs + turnIndex);
+    const end = time(turn.completedAt, start);
+    if (end < start) throw new Error(`Turn ${turn.id} completion precedes start`);
+    const converted: HistoryTurn = { id: `turn:${turn.id}`, order: turnIndex, createdAt: start, completedAt: end, status: state, items: [] };
+    const pendingStart = history.pendingAttachments.length;
+    let finalized = true;
+    for (const [index, rawItem] of (turn.items ?? []).entries()) {
+      const kind = str(rawItem.type);
+      const label = `${turn.id}/${str(rawItem.id) || index}`;
+      let item: HistoryItem | undefined;
+      let pending: PendingAttachment[] = [];
+      try {
+        if (kind === "userMessage") {
+          const texts: string[] = [];
+          for (const part of list(rawItem.content).map(record)) {
+            if (part.type === "text") texts.push(str(part.text));
+            else if (part.type === "localImage" || part.type === "localFile" || part.type === "image") {
+              const candidate = str(part.type === "image" ? part.url : part.path);
+              if (!candidate) throw new Error("Attachment lacks path/URL");
+              pending.push({ type: part.type, candidate });
+            } else history.unsupported.push(`${label}: user content ${str(part.type) || "unknown"}`);
+          }
+          item = { type: "user", text: texts.join("") };
+          if (!item.text && !pending.length) { history.unsupported.push(`${label}: empty/unsupported user input`); continue; }
+        } else if (kind === "agentMessage" || kind === "plan") item = { type: kind === "plan" ? "plan" : "assistant", text: str(rawItem.text) };
+        else if (kind === "reasoning") {
+          const strings = (x: unknown) => list(x).map(value => { if (typeof value !== "string") throw new Error("Non-string reasoning"); return value; });
+          item = { type: "reasoning", summary: strings(rawItem.summary), content: strings(rawItem.content) };
+        } else if (kind === "mcpToolCall" || kind === "functionCallOutput") {
+          if (rawItem.arguments != null && (typeof rawItem.arguments !== "object" || Array.isArray(rawItem.arguments))) throw new Error("Tool arguments must be a JSON object");
+          if (kind === "mcpToolCall" && !str(rawItem.tool)) throw new Error("Tool name is missing");
+          item = { type: "tool", name: str(rawItem.tool ?? rawItem.name) || "functionCallOutput", server: str(rawItem.server ?? rawItem.namespace) || "codex", status: terminal(rawItem.status), ...(rawItem.arguments == null ? {} : { arguments: record(rawItem.arguments) as Extract<HistoryItem, { type: "tool" }>["arguments"] }), ...(rawItem.result === undefined && rawItem.output === undefined ? {} : { result: (rawItem.result ?? rawItem.output ?? null) as Extract<HistoryItem, { type: "tool" }>["result"] }), ...(rawItem.error == null ? {} : { error: typeof rawItem.error === "string" ? rawItem.error : JSON.stringify(rawItem.error) }) };
+        } else if (kind === "commandExecution") item = { type: "command", command: str(rawItem.command), cwd: str(rawItem.cwd), output: str(rawItem.aggregatedOutput), status: terminal(rawItem.status), ...(rawItem.exitCode == null ? {} : { exitCode: rawItem.exitCode as number }) };
+        else if (kind === "fileChange") item = { type: "fileChange", status: terminal(rawItem.status), changes: list(rawItem.changes).map(record).map(change => {
+          const k = typeof change.kind === "string" ? change.kind : str(record(change.kind).type);
+          if (k !== "add" && k !== "delete" && k !== "update") throw new Error(`Unknown file change kind ${k}`);
+          return { path: str(change.path), kind: k, ...(typeof change.movePath === "string" ? { movePath: change.movePath } : {}), ...(typeof change.diff === "string" ? { diff: change.diff } : {}) };
+        }) };
+        else history.unsupported.push(`${label}: ${kind || "unknown item"}`);
+      } catch (cause) {
+        history.unsupported.push(`${label}: ${cause instanceof Error ? cause.message : cause}`);
+        if (cause instanceof Error && cause.message.startsWith("Nonterminal status")) { finalized = false; break; }
+        continue;
       }
+      if (!item) continue;
+      const at = time(rawItem.createdAt, start + Math.floor((end - start) * index / Math.max(1, (turn.items ?? []).length)));
+      if (at < start || at > end) throw new Error(`${label}: item time outside turn`);
+      const entry = { createdAt: at, item };
+      converted.items.push(entry);
+      if (item.type === "user") { history.userMessages++; history.images += pending.filter(p => p.type !== "localFile").length; }
+      if (item.type === "assistant") history.assistantMessages++;
+      if (pending.length) history.pendingAttachments.push({ entry, parts: pending, key: `${converted.id}/${index}` });
     }
-    add("turn/completed", { providerThreadId: meta.id, status: status(turn.status) }, end, turnId);
-    previousEnd = end;
+    if (!finalized) {
+      history.pendingAttachments.splice(pendingStart);
+      history.unsupported.push(`${turn.id}: unfinished item; whole turn and later turns deferred`);
+      break;
+    }
+    if (converted.items.length > 100) throw new Error(`Turn ${turn.id} exceeds 100 items; whole turns cannot be split`);
+    if (converted.items.length) history.turns.push(converted);
   }
-  return { events, userMessages: users, assistantMessages: assistants, images };
+  return history;
 }

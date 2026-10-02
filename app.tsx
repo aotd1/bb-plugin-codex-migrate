@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { definePluginApp, useRealtime, useRpc } from "@get-bb/plugin-sdk/app";
-import type { ProjectSummary, RunStatus, rpcContract } from "./server";
+import type { ApplyReport, ProjectSummary, RunStatus, rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 
@@ -9,15 +9,18 @@ function CodexMigrationPage() {
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
   const [selectedRoots, setSelectedRoots] = useState<string[]>([]);
   const [gitInitRoots, setGitInitRoots] = useState<string[]>([]);
+  const [selectedThreads, setSelectedThreads] = useState<string[]>([]);
   const [preview, setPreview] = useState<ProjectSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [report, setReport] = useState<ApplyReport | null>(null);
   const [current, setCurrent] = useState<RunStatus | null>(null);
 
   const refreshStatus = useCallback(async () => {
     const status = await rpc.call("status", null);
     setCurrent(status.current);
+    setReport(status.report);
   }, [rpc]);
 
   useRealtime("migration-progress", () => { void refreshStatus().catch(() => {}); });
@@ -67,6 +70,7 @@ function CodexMigrationPage() {
     try {
       const result = await rpc.call("scan", { projects: [], roots: selectedRoots, all: false, includeThreads: true });
       setPreview(result.projects);
+      setSelectedThreads([...new Set(result.projects.flatMap(project => project.threads.map(thread => thread.id)))]);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -75,14 +79,14 @@ function CodexMigrationPage() {
   };
 
   const uniqueRoots = [...new Map(preview?.flatMap((project) => project.rootDetails.map((root) => [root.key, root])) ?? []).values()];
-  const unresolvedConflicts = [...new Map(preview?.flatMap((project) => project.conflicts.map((conflict) => [conflict.sourceId, conflict])) ?? []).values()];
+  const unresolvedConflicts = [...new Map(preview?.flatMap((project) => project.conflicts.filter(conflict => selectedThreads.includes(conflict.sourceId)).map((conflict) => [conflict.sourceId, conflict])) ?? []).values()];
   const eligibleRoots = uniqueRoots.filter((root) => root.kind !== "missing" && (root.kind !== "non-git" || gitInitRoots.includes(root.key)));
   const startImport = async () => {
-    if (selectedRoots.length === 0 || preview === null || eligibleRoots.length === 0 || starting || current?.state === "running" || unresolvedConflicts.length > 0) return;
+    if (selectedRoots.length === 0 || preview === null || eligibleRoots.length === 0 || starting || current?.state === "running" || selectedThreads.length === 0 || unresolvedConflicts.length > 0) return;
     setStarting(true);
     setError(null);
     try {
-      await rpc.call("start", { projects: [], roots: selectedRoots, gitInitRoots: gitInitRoots.filter((key) => selectedRoots.includes(key)), all: false, existingOnly: false, limit: null });
+      await rpc.call("start", { projects: [], roots: selectedRoots, gitInitRoots: gitInitRoots.filter((key) => selectedRoots.includes(key)), all: false, existingOnly: false, limit: null, threadIds: selectedThreads });
       await refreshStatus();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -97,6 +101,10 @@ function CodexMigrationPage() {
         <h1 className="text-xl font-semibold">Import from Codex</h1>
         <p className="mt-2 text-sm text-muted-foreground">Select folders to import. Shared folders stay selected together in every Codex project.</p>
         <p className="mt-1 text-xs text-muted-foreground">Imported chat titles are shortened to 80 characters by default. Change the mode or length in Settings → Installed plugins → Codex Migrate.</p>
+        {report && current?.state !== "running" && report.projects.some(project => project.partiallyImported.length || project.failed.length) && <section className="mt-4 rounded-lg border border-border p-3 text-sm" aria-label="Migration limitations">
+          <p className="font-medium">Saved history may be partial. Review these conversations before continuing.</p>
+          {report.projects.flatMap(project => [...project.partiallyImported, ...project.failed].map(entry => <p key={`${project.sourceId}:${entry.sourceId}`} className="mt-2 break-words text-xs">{entry.sourceId} · {entry.message}</p>))}
+        </section>}
         {error && <p role="alert" className="mt-3 text-sm text-destructive">{error}</p>}
         {projects === null ? <p className="mt-6 text-sm text-muted-foreground">Scanning Codex projects…</p> : (
           <div className="mt-5 divide-y divide-border rounded-lg border border-border bg-card">
@@ -154,7 +162,7 @@ function CodexMigrationPage() {
             <h2 className="break-all font-medium">{root.path}</h2>
             <p className="mt-1 text-sm text-muted-foreground">{root.candidates} chats · {root.linkedProjects.join(", ")} → {root.targetProjectId ? `BB: ${root.targetProjectName}` : `new BB project: ${root.targetProjectName}`}</p>
             {root.kind === "subfolder" && <p className="mt-2 text-sm">This folder is inside a Git repository. Its chats will go to the parent repository project at {root.targetPath}.</p>}
-            {root.kind === "worktree" && <p className="mt-2 text-sm">Chats from this worktree will go to the main repository project at {root.targetPath}.</p>}
+            {root.kind === "worktree" && <p className="mt-2 text-sm">Worktree chats will go to the main repository project at {root.targetPath}.</p>}
             {root.kind === "missing" && <p className="mt-2 text-sm text-destructive">The folder is missing. Deselect it before importing.</p>}
             {root.kind === "non-git" && <div className="mt-3 rounded border border-border p-3 text-sm">
               <p>Warning: this folder is not in a Git repository. Import will run git init here without creating a commit or remote.</p>
@@ -165,14 +173,21 @@ function CodexMigrationPage() {
               {!gitInitRoots.includes(root.key) && <p className="mt-2 text-muted-foreground">This folder will be skipped.</p>}
             </div>}
           </section>)}
+          <section className="rounded-lg border border-border p-4">
+            <h2 className="font-medium">Select conversations</h2>
+            {[...new Map(preview.flatMap(project => project.threads.map(thread => [thread.id, thread] as const))).values()].map(thread => <div key={thread.id} className="mt-3">
+              <label className="flex items-center gap-2 text-sm"><Checkbox checked={selectedThreads.includes(thread.id)} onCheckedChange={checked => setSelectedThreads(current => checked === true ? [...current, thread.id] : current.filter(id => id !== thread.id))} />{thread.title || thread.id}{thread.archived ? " · archived" : ""}{thread.alreadyImported ? " · existing in BB" : ""}</label>
+              {thread.limitations.map((limitation, index) => <p key={index} className="mt-1 text-xs text-muted-foreground">{limitation}</p>)}
+            </div>)}
+          </section>
           {unresolvedConflicts.length > 0 && <div className="rounded border border-destructive p-3 text-xs text-destructive">
             <p>{unresolvedConflicts.length} chats need a destination decision before importing.</p>
             {unresolvedConflicts.slice(0, 10).map((conflict) => <p key={conflict.sourceId} className="mt-1 truncate">{conflict.title || conflict.sourceId} · {conflict.reason} · {conflict.cwd}{conflict.importedProjectId ? ` · BB ${conflict.importedProjectId}` : ""}</p>)}
           </div>}
           <div className="rounded-lg border border-border bg-card p-4">
             {unresolvedConflicts.length > 0 && <p className="mt-2 text-sm text-destructive">{unresolvedConflicts.length} conflicts still block import.</p>}
-            <p className="text-sm">{eligibleRoots.length} unique folders will be imported. A BB database backup is created before BB changes.</p>
-            <Button className="mt-3" onClick={startImport} disabled={starting || current?.state === "running" || eligibleRoots.length === 0 || uniqueRoots.some((root) => root.kind === "missing") || unresolvedConflicts.length > 0}>{current?.state === "running" ? `Importing ${current.processed} / ${current.total}…` : starting ? "Starting import…" : "Import selected folders"}</Button>
+            <p className="text-sm">{eligibleRoots.length} unique folders will be imported. History is saved in atomic batches. A failed run can leave committed history; rerun the same selection to continue.</p>
+            <Button className="mt-3" onClick={startImport} disabled={starting || current?.state === "running" || eligibleRoots.length === 0 || uniqueRoots.some((root) => root.kind === "missing") || unresolvedConflicts.length > 0 || selectedThreads.length === 0}>{current?.state === "running" ? `Importing ${current.processed} / ${current.total}…` : starting ? "Starting import…" : "Import selected folders"}</Button>
             {current?.state === "running" && <p className="mt-2 text-xs text-muted-foreground" role="status">{current.imported} added this run{current.partiallyImported > 0 ? ` · ${current.partiallyImported} partially imported` : ""} · {current.existing} already in BB · {current.skippedEmpty} empty skipped{current.failed > 0 ? ` · ${current.failed} failed` : ""}{currentFolder ? ` · ${currentFolder}` : ""} · Updated {new Date(current.updatedAt).toLocaleTimeString()}</p>}
           </div>
         </div>}
@@ -182,5 +197,5 @@ function CodexMigrationPage() {
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "codex-migrate", title: "Codex migration", icon: "codex-migrate/import", path: "codex-migrate", component: CodexMigrationPage });
+  app.slots.navPanel({ id: "codex-migrate", title: "Codex migration", path: "codex-migrate", component: CodexMigrationPage, icon: "codex-migrate/import" });
 });
