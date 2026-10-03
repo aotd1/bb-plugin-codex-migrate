@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "engines": {
-    "bb": ">=0.44 <0.45",
+    "bb": ">=0.44 <0.46",
     "bbPluginSdk": ">=0.6.11 <0.7"
   },
   "bb": {
