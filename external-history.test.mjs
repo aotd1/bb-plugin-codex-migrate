@@ -180,3 +180,30 @@ test('ensure uses routed project source rather than original Codex worktree cwd'
     assert.equal(request.expectedSourcePath,meta.cwd);assert.notEqual(request.expectedSourcePath,source.cwd);assertNoModel(f.harness);
   }finally{await f.harness.lifecycle.dispose();}
 });
+
+test('legacy adoption acknowledges supported subset by source IDs and keeps omitted/deferred events',async()=>{
+  for(const archived of [false,true]){
+    const raw=rawHistory(2);raw.turns[0].items.push({type:'webSearch',id:'ws'});raw.turns[1].status='inProgress';
+    const events=[rows()[0]];let seq=2;
+    for(const [i,t] of raw.turns.entries()){
+      const req=`req-${i}`;events.push({seq:seq++,type:'client/turn/requested',scope:{kind:'thread'},createdAt:1000+i,data:{requestId:req,input:t.items[0].content}});
+      events.push({seq:seq++,type:'turn/input/accepted',scope:{kind:'turn',turnId:t.id},createdAt:1000+i,data:{clientRequestId:req}});
+      for(const item of t.items.slice(1))events.push({seq:seq++,type:'item/completed',scope:{kind:'turn',turnId:t.id},createdAt:1000+i,data:{item}});
+    }
+    const f=fixture({legacyThreads:[legacyThread('thr_legacy',archived)],events:{thr_legacy:events}});try{
+      const s=store(f);await s.load([meta.id],['proj_import']);const history=convertHistory(raw,meta);await s.diagnoseLegacy(meta,history);
+      const r=await s.importThread({...args(history),source:{...meta,archived}});
+      assert.equal(r.threadId,'thr_legacy');assert.equal(f.timeline.length,0);assert.equal(f.calls[0].turns.length,1);
+      assert.deepEqual(f.calls[0].turns[0].items.map(i=>i.existingSequence),[2,4]);
+      assert.match(r.limitations.join(','),/webSearch/);assert.match(r.limitations.join(','),/unfinished/);assertNoModel(f.harness);
+      const replay=await s.importThread({...args(convertHistory(raw,meta)),source:{...meta,archived}});assert.equal(replay.threadId,r.threadId);assert.equal(f.timeline.length,0);
+      for(const [mutate,reason] of [
+        [events=>events.push({seq:999,type:'item/completed',scope:{kind:'turn',turnId:'foreign'},createdAt:2000,data:{item:{type:'agentMessage',id:'foreign',text:'extra'}}}),/outside the source snapshot/],
+        [events=>{events.find(e=>e.type==='item/completed'&&e.data.item.id==='a-1').data.item={type:'toolCall',id:'a-1',tool:'invalid',error:null};},/Invalid legacy/],
+        [events=>{events.find(e=>e.type==='item/completed'&&e.data.item.id==='a-0').data.item.text='changed';},/content differs/],
+      ]){const invalid=structuredClone(events);mutate(invalid);const g=fixture({legacyThreads:[legacyThread()],events:{thr_legacy:invalid}});try{const other=store(g);await other.load([meta.id],['proj_import']);await assert.rejects(other.diagnoseLegacy(meta,convertHistory(raw,meta)),reason);assert.equal(g.calls.length,0);}finally{await g.harness.lifecycle.dispose();}}
+      const changed=structuredClone(events);changed.find(e=>e.type==='item/completed'&&e.data.item.id==='ws').data.item.id='wrong';
+      const g=fixture({legacyThreads:[legacyThread()],events:{thr_legacy:changed}});try{const other=store(g);await other.load([meta.id],['proj_import']);await assert.rejects(other.diagnoseLegacy(meta,convertHistory(raw,meta)),/identity differs/);assert.equal(g.calls.length,0);}finally{await g.harness.lifecycle.dispose();}
+    }finally{await f.harness.lifecycle.dispose();}
+  }
+});

@@ -66,6 +66,30 @@ function runtimeRows(rows: EventRow[], turnId: string): EventRow[] {
   const requests = accepted.map(r => r.type === "turn/input/accepted" ? r.data.clientRequestId : null);
   return rows.filter(r => (r.type === "client/turn/requested" && requests.includes(r.data.requestId)) || (r.scope.kind === "turn" && r.scope.turnId === turnId && r.type === "item/completed" && r.data.item.type !== "userMessage"));
 }
+// Acknowledge a verified supported subset by source turn identity. Other legacy
+// events remain untouched; omissions/deferred turns are reported by the converter.
+function legacyRows(history: History, events: EventRow[]): EventRow[] {
+  const flat = events.filter(r => r.type === "client/turn/requested" || r.type === "item/completed");
+  // Invalid old canonical tools must never be hidden by an omission/deferred turn.
+  for (const row of flat) if (row.type === "item/completed" && row.data.item.type === "toolCall" && Object.hasOwn(row.data.item,"error") && row.data.item.error === null) throw new Error("Invalid legacy tool error:null; public import cannot repair it");
+  const entries = history.turns.flatMap(t => t.items);
+  if (flat.length === entries.length) return flat;
+  const selected: EventRow[] = [];
+  const covered = new Set<number>();
+  for (const layout of history.legacyLayout) {
+    const rows = runtimeRows(events,layout.turnId);
+    if (rows.length !== layout.itemIds.length) throw new Error(`Legacy item count differs in source turn ${layout.turnId}`);
+    for (const [i,row] of rows.entries()) {
+      if (covered.has(row.seq)) throw new Error("Legacy sequence maps to several source turns");
+      covered.add(row.seq);
+      if (row.type === "item/completed" && layout.itemIds[i] !== null && row.data.item.id !== layout.itemIds[i]) throw new Error(`Legacy source item identity differs at sequence ${row.seq}`);
+    }
+    if (!layout.deferred) selected.push(...layout.supportedIndices.map(i => rows[i]!));
+  }
+  if (flat.some(row => !covered.has(row.seq))) throw new Error("Legacy has additional events outside the source snapshot");
+  if (selected.length !== entries.length) throw new Error("Legacy supported item count differs from source snapshot");
+  return selected;
+}
 function semantic(row: EventRow): HistoryItem | null {
   if (row.type === "client/turn/requested") {
     const input = row.data.input;
@@ -144,7 +168,7 @@ export class ExternalHistoryStore {
     const existing = this.existing(source.id);
     if (!existing || existing.binding) return;
     if (existing.conflict) throw new Error(existing.conflict);
-    const rows = (await this.events(existing.threadId)).filter(row => row.type === "client/turn/requested" || row.type === "item/completed");
+    const rows = legacyRows(history,await this.events(existing.threadId));
     const entries = history.turns.flatMap(turn => turn.items);
     if (rows.length !== entries.length) throw new Error("Legacy item count differs from the source snapshot");
     for (const [i, entry] of entries.entries()) {
@@ -171,7 +195,7 @@ export class ExternalHistoryStore {
         if (pending) result.set(pending.key, item.attachments ?? []);
       }
     };
-    if (!existing.binding) match(history.turns.flatMap(turn => turn.items), events.filter(row => row.type === "client/turn/requested" || row.type === "item/completed"));
+    if (!existing.binding) match(history.turns.flatMap(turn => turn.items), legacyRows(history,events));
     else if (existing.binding.mode === "interactive") for (const turn of history.turns.filter(t => t.order > (existing.binding!.lastOrder ?? -1))) {
       const rows = runtimeRows(events,turn.id.slice("turn:".length));
       if (rows.length) match(turn.items,rows);
@@ -188,7 +212,7 @@ export class ExternalHistoryStore {
     const adopted = existing && !binding;
     const turns = structuredClone(history.turns);
     if (adopted || binding?.archived) {
-      const rows = (await this.events(existing?.threadId ?? binding!.threadId)).filter(r => r.type === "client/turn/requested" || r.type === "item/completed");
+      const rows = legacyRows(history,await this.events(existing?.threadId ?? binding!.threadId));
       const flat = turns.flatMap(t => t.items);
       if (flat.length !== rows.length) throw new Error("Legacy adoption conflict: item count differs; no history will be rewritten");
       for (const [i, entry] of flat.entries()) {

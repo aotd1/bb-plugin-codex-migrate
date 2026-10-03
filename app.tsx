@@ -79,6 +79,7 @@ function CodexMigrationPage() {
   };
 
   const uniqueRoots = [...new Map(preview?.flatMap((project) => project.rootDetails.map((root) => [root.key, root])) ?? []).values()];
+  const conversationConflicts = new Map(preview?.flatMap(project => project.conflicts.map(conflict => [conflict.sourceId, conflict] as const)) ?? []);
   const unresolvedConflicts = [...new Map(preview?.flatMap((project) => project.conflicts.filter(conflict => selectedThreads.includes(conflict.sourceId)).map((conflict) => [conflict.sourceId, conflict])) ?? []).values()];
   const eligibleRoots = uniqueRoots.filter((root) => root.kind !== "missing" && (root.kind !== "non-git" || gitInitRoots.includes(root.key)));
   const startImport = async () => {
@@ -175,13 +176,15 @@ function CodexMigrationPage() {
           </section>)}
           <section className="rounded-lg border border-border p-4">
             <h2 className="font-medium">Select conversations</h2>
+            {unresolvedConflicts.length > 0 && <Button className="mt-2" onClick={() => setSelectedThreads(current => current.filter(id => !conversationConflicts.has(id)))}>Exclude conflicted conversations</Button>}
             {[...new Map(preview.flatMap(project => project.threads.map(thread => [thread.id, thread] as const))).values()].map(thread => <div key={thread.id} className="mt-3">
               <label className="flex items-center gap-2 text-sm"><Checkbox checked={selectedThreads.includes(thread.id)} onCheckedChange={checked => setSelectedThreads(current => checked === true ? [...current, thread.id] : current.filter(id => id !== thread.id))} />{thread.title || thread.id}{thread.archived ? " · archived" : ""}{thread.alreadyImported ? " · existing in BB" : ""}</label>
+              {conversationConflicts.has(thread.id) && <p className="mt-1 text-xs text-destructive">{conversationConflicts.get(thread.id)!.reason}</p>}
               {thread.limitations.map((limitation, index) => <p key={index} className="mt-1 text-xs text-muted-foreground">{limitation}</p>)}
             </div>)}
           </section>
           {unresolvedConflicts.length > 0 && <div className="rounded border border-destructive p-3 text-xs text-destructive">
-            <p>{unresolvedConflicts.length} chats need a destination decision before importing.</p>
+            <p>{unresolvedConflicts.length} selected conversations have conflicts; review their reasons or exclude them.</p>
             {unresolvedConflicts.slice(0, 10).map((conflict) => <p key={conflict.sourceId} className="mt-1 truncate">{conflict.title || conflict.sourceId} · {conflict.reason} · {conflict.cwd}{conflict.importedProjectId ? ` · BB ${conflict.importedProjectId}` : ""}</p>)}
           </div>}
           <div className="rounded-lg border border-border bg-card p-4">

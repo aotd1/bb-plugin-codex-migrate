@@ -9,6 +9,7 @@ export type HistoryItem = HistoryTurn["items"][number]["item"];
 export interface PendingAttachment { type: "localImage" | "localFile" | "image"; candidate: string }
 export interface History {
   turns: HistoryTurn[];
+  legacyLayout: { turnId: string; itemIds: (string | null)[]; supportedIndices: number[]; deferred: boolean }[];
   pendingAttachments: { entry: HistoryTurn["items"][number]; parts: PendingAttachment[]; key: string }[];
   unsupported: string[];
   userMessages: number;
@@ -34,7 +35,7 @@ function time(x: unknown, fallback: number): number {
 export function convertHistory(raw: unknown, meta: SourceThread): History {
   const source = z.object({ id: z.string(), turns: z.array(z.object({ id: z.string(), startedAt: z.number().nullable().optional(), completedAt: z.number().nullable().optional(), status: z.string().optional(), items: z.array(z.record(z.string(), z.unknown())).optional() }).passthrough()).optional() }).passthrough().parse(raw);
   if (source.id !== meta.id) throw new Error(`Codex thread identity mismatch for ${meta.id}`);
-  const history: History = { turns: [], pendingAttachments: [], unsupported: [], userMessages: 0, assistantMessages: 0, images: 0 };
+  const history: History = { turns: [], legacyLayout: (source.turns ?? []).map(turn => ({turnId:turn.id,itemIds:(turn.items ?? []).map(item => str(item.id) || null),supportedIndices:[],deferred:true})), pendingAttachments: [], unsupported: [], userMessages: 0, assistantMessages: 0, images: 0 };
   const ids = new Set<string>();
   for (const [turnIndex, turn] of (source.turns ?? []).entries()) {
     if (ids.has(turn.id)) throw new Error(`Duplicate source turn ID: ${turn.id}`);
@@ -90,6 +91,7 @@ export function convertHistory(raw: unknown, meta: SourceThread): History {
       if (at < start || at > end) throw new Error(`${label}: item time outside turn`);
       const entry = { createdAt: at, item };
       converted.items.push(entry);
+      history.legacyLayout[turnIndex]!.supportedIndices.push(index);
       if (item.type === "user") { history.userMessages++; history.images += pending.filter(p => p.type !== "localFile").length; }
       if (item.type === "assistant") history.assistantMessages++;
       if (pending.length) history.pendingAttachments.push({ entry, parts: pending, key: `${converted.id}/${index}` });
@@ -99,6 +101,7 @@ export function convertHistory(raw: unknown, meta: SourceThread): History {
       history.unsupported.push(`${turn.id}: unfinished item; whole turn and later turns deferred`);
       break;
     }
+    history.legacyLayout[turnIndex]!.deferred = false;
     if (converted.items.length > 100) throw new Error(`Turn ${turn.id} exceeds 100 items; whole turns cannot be split`);
     if (converted.items.length) history.turns.push(converted);
   }
