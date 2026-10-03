@@ -4,6 +4,17 @@ import type { ApplyReport, ProjectSummary, RunStatus, rpcContract } from "./serv
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 
+function conflictType(reason: string): string {
+  const detail = reason.replace(/^Legacy diagnostic conflict: /, "");
+  if (detail.startsWith("Legacy content differs")) return "Legacy content mismatch";
+  if (detail.startsWith("Legacy item count differs") || detail.startsWith("Legacy supported item count differs")) return "Legacy item count mismatch";
+  if (detail.startsWith("Legacy has additional events")) return "Unmapped legacy events";
+  if (detail.startsWith("Legacy source item identity differs")) return "Legacy item identity mismatch";
+  if (detail.startsWith("Invalid legacy tool")) return "Invalid legacy tool data";
+  if (detail.startsWith("Ambiguous Codex session:")) return "Ambiguous Codex session";
+  return detail.replace(/ at sequence \d+.*$/, "").replace(/ in source turn .*$/, "");
+}
+
 function CodexMigrationPage() {
   const rpc = useRpc<typeof rpcContract>();
   const [projects, setProjects] = useState<ProjectSummary[] | null>(null);
@@ -81,6 +92,11 @@ function CodexMigrationPage() {
   const uniqueRoots = [...new Map(preview?.flatMap((project) => project.rootDetails.map((root) => [root.key, root])) ?? []).values()];
   const conversationConflicts = new Map(preview?.flatMap(project => project.conflicts.map(conflict => [conflict.sourceId, conflict] as const)) ?? []);
   const unresolvedConflicts = [...new Map(preview?.flatMap((project) => project.conflicts.filter(conflict => selectedThreads.includes(conflict.sourceId)).map((conflict) => [conflict.sourceId, conflict])) ?? []).values()];
+  const conflictGroups = new Map<string, string[]>();
+  for (const conflict of unresolvedConflicts) {
+    const type = conflictType(conflict.reason);
+    conflictGroups.set(type, [...(conflictGroups.get(type) ?? []), conflict.sourceId]);
+  }
   const eligibleRoots = uniqueRoots.filter((root) => root.kind !== "missing" && (root.kind !== "non-git" || gitInitRoots.includes(root.key)));
   const startImport = async () => {
     if (selectedRoots.length === 0 || preview === null || eligibleRoots.length === 0 || starting || current?.state === "running" || selectedThreads.length === 0 || unresolvedConflicts.length > 0) return;
@@ -189,6 +205,13 @@ function CodexMigrationPage() {
           </div>}
           <div className="rounded-lg border border-border bg-card p-4">
             {unresolvedConflicts.length > 0 && <p className="mt-2 text-sm text-destructive">{unresolvedConflicts.length} conflicts still block import.</p>}
+            {conflictGroups.size > 0 && <div className="mt-3 space-y-2" aria-label="Deselect conversations by conflict type">
+              <p className="text-sm">Deselect conversations by conflict type:</p>
+              {[...conflictGroups].map(([type, ids]) => <Button key={type} variant="outline" className="mr-2 h-auto whitespace-normal text-left" onClick={() => {
+                const excluded = new Set(ids);
+                setSelectedThreads(current => current.filter(id => !excluded.has(id)));
+              }}>Deselect: {type} ({ids.length})</Button>)}
+            </div>}
             <p className="text-sm">{eligibleRoots.length} unique folders will be imported. History is saved in atomic batches. A failed run can leave committed history; rerun the same selection to continue.</p>
             <Button className="mt-3" onClick={startImport} disabled={starting || current?.state === "running" || eligibleRoots.length === 0 || uniqueRoots.some((root) => root.kind === "missing") || unresolvedConflicts.length > 0 || selectedThreads.length === 0}>{current?.state === "running" ? `Importing ${current.processed} / ${current.total}…` : starting ? "Starting import…" : "Import selected folders"}</Button>
             {current?.state === "running" && <p className="mt-2 text-xs text-muted-foreground" role="status">{current.imported} added this run{current.partiallyImported > 0 ? ` · ${current.partiallyImported} partially imported` : ""} · {current.existing} already in BB · {current.skippedEmpty} empty skipped{current.failed > 0 ? ` · ${current.failed} failed` : ""}{currentFolder ? ` · ${currentFolder}` : ""} · Updated {new Date(current.updatedAt).toLocaleTimeString()}</p>}
