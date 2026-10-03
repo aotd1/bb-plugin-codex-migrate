@@ -80,8 +80,8 @@ test('active turn, queued work and failed bind are reported without interruption
   for(const reason of ['active turn','queued BB work','inflight context mutation']){const f=fixture({conflict:reason});try{await assert.rejects(store(f).importThread(args(convertHistory(rawHistory(),meta))),new RegExp(reason));assertNoModel(f.harness);}finally{await f.harness.lifecycle.dispose();}}
   const f=fixture({bindConflict:'host/provider unavailable'});try{const r=await store(f).importThread(args(convertHistory(rawHistory(),meta)));assert.match(r.limitations.join(','),/continuation pending/);assert.equal(f.timeline.length,1);assertNoModel(f.harness);}finally{await f.harness.lifecycle.dispose();}
 });
-test('missing environment leaves explicit passive history and unsupported items stay partial',async()=>{
-  const f=fixture({noEnvironment:true});try{const raw=rawHistory();raw.turns[0].items.push({type:'provider-extension'});const r=await store(f).importThread(args(convertHistory(raw,meta)));assert.match(r.limitations.join(','),/provider-extension/);assert.match(r.limitations.join(','),/No ready environment/);assert.equal(f.harness.inspection.sdk.callsTo('threads.experimental_bindExternalSession').length,0);}finally{await f.harness.lifecycle.dispose();}
+test('ensure failure leaves explicit passive history and unsupported items stay partial',async()=>{
+  const f=fixture({noEnvironment:true,ensureConflict:'checkout owned or preparing'});try{const raw=rawHistory();raw.turns[0].items.push({type:'provider-extension'});const r=await store(f).importThread(args(convertHistory(raw,meta)));assert.match(r.limitations.join(','),/provider-extension/);assert.match(r.limitations.join(','),/checkout owned or preparing/);assert.equal(f.harness.inspection.sdk.callsTo('threads.experimental_bindExternalSession').length,0);}finally{await f.harness.lifecycle.dispose();}
 });
 test('uploads are cached before history mutation and retries preserve canonical attachment references',async()=>{
   const uploads=[];const f=fixture({uploads});const catalog={imageDataUrls:async()=>[],imageDataUrlsByPath:async()=>new Map(),relatedImageDataUrlsByPath:async()=>new Map()};
@@ -118,15 +118,15 @@ test('all later batches are prevalidated before the first history write',async()
 });
 test('ambiguous environments and teardown lifecycle never bind arbitrarily',async()=>{
   const f=fixture();try{f.harness.sdk.stub('environments.list',async()=>[{id:'one',lifecycle:{phase:'active',teardown:null}},{id:'two',lifecycle:{phase:'active',teardown:null}}]);const r=await store(f).importThread(args(convertHistory(rawHistory(),meta)));assert.match(r.limitations.join(','),/Several ready environments/);assert.equal(f.harness.inspection.sdk.callsTo('threads.experimental_bindExternalSession').length,0);}finally{await f.harness.lifecycle.dispose();}
-  const g=fixture();try{g.harness.sdk.stub('environments.list',async()=>[{id:'bad',lifecycle:{phase:'teardown',teardown:{status:'running'}}}]);const r=await store(g).importThread(args(convertHistory(rawHistory(),meta)));assert.match(r.limitations.join(','),/No ready environment/);}finally{await g.harness.lifecycle.dispose();}
+  const g=fixture({ensureConflict:'checkout teardown in progress'});try{g.harness.sdk.stub('environments.list',async()=>[{id:'bad',lifecycle:{phase:'teardown',teardown:{status:'running'}}}]);const r=await store(g).importThread(args(convertHistory(rawHistory(),meta)));assert.match(r.limitations.join(','),/checkout teardown/);}finally{await g.harness.lifecycle.dispose();}
 });
 test('public SDK boundary and pinned SDK provenance',async()=>{
   const result=await experimental_scanPublicSdkOnly(process.cwd(),{allow:[/^@\//,/^react(?:-dom)?(?:\/|$)/,/^@get-bb\/plugin-sdk\/testing$/, /^@radix-ui\//,/^(class-variance-authority|clsx|tailwind-merge|better-sqlite3|zod)$/, /^node:/]});
   assert.deepEqual(result.violations,[]);assert.deepEqual(result.privateDependencies,[]);
   for(const path of ['server.ts','external-history.ts','history.ts','attachments.ts']){const text=readFileSync(path,'utf8');assert.doesNotMatch(text,/bb\.db|better-sqlite3|\.prepare\(|\bdb\.exec\(|@bb\/db|BbStore|repairImported|appendStoredThread/);}
-  assert.equal(JSON.parse(readFileSync('node_modules/@get-bb/plugin-sdk/package.json')).version,'0.6.10');
-  const manifest=JSON.parse(readFileSync('package.json'));assert.equal(manifest.engines.bbPluginSdk,'>=0.6.10');assert.equal(manifest.devDependencies['@get-bb/plugin-sdk'],'file:vendor-sdk/get-bb-plugin-sdk-0.6.10.tgz');
-  assert.equal(createHash('sha256').update(readFileSync('vendor-sdk/get-bb-plugin-sdk-0.6.10.tgz')).digest('hex'),'84ba07fc838b1eb66d15833bd148f29400e1265cb1cd31d927c057e56ed9504f');
+  assert.equal(JSON.parse(readFileSync('node_modules/@get-bb/plugin-sdk/package.json')).version,'0.6.11');
+  const manifest=JSON.parse(readFileSync('package.json'));assert.equal(manifest.engines.bbPluginSdk,'>=0.6.11 <0.7');assert.equal(manifest.devDependencies['@get-bb/plugin-sdk'],'file:vendor-sdk/get-bb-plugin-sdk-0.6.11.tgz');
+  assert.equal(createHash('sha256').update(readFileSync('vendor-sdk/get-bb-plugin-sdk-0.6.11.tgz')).digest('hex'),'6202184def479b559065deb98d4c42dd57d21ed77875ec9a0e04509b83f5f53d');
 });
 test('legacy preview identifies invalid rows and unsettled or changed session claims without mutation',async()=>{
   const scenarios=[
@@ -135,4 +135,48 @@ test('legacy preview identifies invalid rows and unsettled or changed session cl
     {legacyThreads:[legacyThread()],events:{thr_legacy:rows('changed')},reason:/content differs/},
   ];
   for(const options of scenarios){const f=fixture(options);try{const s=store(f);await s.load([meta.id],['proj_import']);await assert.rejects(s.diagnoseLegacy(meta,convertHistory(rawHistory(),meta)),options.reason);assert.equal(f.calls.length,0);}finally{await f.harness.lifecycle.dispose();}}
+});
+
+test('missing environment ensures the recorded local source once and binds original handle',async()=>{
+  const f=fixture({noEnvironment:true});try{
+    const a=await store(f).importThread(args(convertHistory(rawHistory(),meta)));
+    const b=await store(f).importThread(args(convertHistory(rawHistory(),meta)));
+    assert.deepEqual(a.limitations,[]);assert.equal(a.threadId,b.threadId);assert.equal(f.timeline.length,1);
+    const calls=f.harness.inspection.sdk.callsTo('environments.experimental_ensureProjectCheckout');
+    assert.equal(calls.length,1);assert.deepEqual(calls[0][0],{projectId:'proj_import',hostId:'host_source',expectedSourceId:'src_local',expectedSourcePath:meta.cwd});
+    const bind=f.harness.inspection.sdk.callsTo('threads.experimental_bindExternalSession')[0][0];
+    assert.equal(bind.environmentId,'env_ensured');assert.equal(bind.providerThreadId,meta.id);assert.equal(bind.expectedSessionId,meta.id);assert.equal(bind.expectedGeneration,0);assertNoModel(f.harness);
+  }finally{await f.harness.lifecycle.dispose();}
+});
+test('existing ready environment and archived imports never provision another checkout',async()=>{
+  for(const archived of [false,true]){const f=fixture();try{await store(f).importThread(args(convertHistory(rawHistory(),{...meta,archived})));assert.equal(f.harness.inspection.sdk.callsTo('environments.experimental_ensureProjectCheckout').length,0);assertNoModel(f.harness);}finally{await f.harness.lifecycle.dispose();}}
+});
+test('source admission and ensure CAS failures remain pending without binding or fallback',async()=>{
+  const source={id:'source',type:'local_path',hostId:'host_source',path:meta.cwd};
+  for(const options of [
+    {sources:[],reason:/exactly one/},
+    {sources:[source,{...source,id:'another'}],reason:/exactly one/},
+    {sources:[{...source,hostId:'foreign'}],reason:/exactly one/},
+    {sources:[{...source,path:'/changed'}],reason:/source path changed/},
+    {ensureConflict:'source CAS changed',reason:/source CAS changed/},
+    {ensureConflict:'host inspection failed',reason:/host inspection failed/},
+    {ensureConflict:'SDK method unavailable on this server',reason:/SDK method unavailable/},
+  ]){const f=fixture({noEnvironment:true,...options});try{const r=await store(f).importThread(args(convertHistory(rawHistory(),meta)));assert.match(r.limitations.join(','),options.reason);assert.equal(f.timeline.length,1);assert.equal(f.harness.inspection.sdk.callsTo('threads.experimental_bindExternalSession').length,0);assertNoModel(f.harness);}finally{await f.harness.lifecycle.dispose();}}
+});
+test('bind failure after ensure keeps passive binding and replay retries with same source CAS',async()=>{
+  const f=fixture({noEnvironment:true,bindConflict:'environment acquired concurrently'});try{
+    for(let i=0;i<2;i++){const r=await store(f).importThread(args(convertHistory(rawHistory(),meta)));assert.match(r.limitations.join(','),/continuation pending.*environment acquired/);}
+    assert.equal(f.timeline.length,1);assert.equal([...f.bindings.values()][0].mode,'passive');
+    const calls=f.harness.inspection.sdk.callsTo('environments.experimental_ensureProjectCheckout');assert.equal(calls.length,2);assert.deepEqual(calls[0],calls[1]);assertNoModel(f.harness);
+  }finally{await f.harness.lifecycle.dispose();}
+});
+
+test('ensure uses routed project source rather than original Codex worktree cwd',async()=>{
+  const f=fixture({noEnvironment:true});try{
+    const source={...meta,cwd:'/source/.codex/worktrees/abc/repo'};
+    const r=await store(f).importThread({...args(convertHistory(rawHistory(),source)),source});
+    assert.deepEqual(r.limitations,[]);
+    const request=f.harness.inspection.sdk.callsTo('environments.experimental_ensureProjectCheckout')[0][0];
+    assert.equal(request.expectedSourcePath,meta.cwd);assert.notEqual(request.expectedSourcePath,source.cwd);assertNoModel(f.harness);
+  }finally{await f.harness.lifecycle.dispose();}
 });

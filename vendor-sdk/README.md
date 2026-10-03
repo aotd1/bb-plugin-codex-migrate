@@ -1,13 +1,13 @@
 # Fork SDK provenance
 
-`get-bb-plugin-sdk-0.6.10.tgz` is the public `@get-bb/plugin-sdk` package packed from `aotd1/bb` external-history-api at `7f6e2ac5e`, copied byte-for-byte from the existing Dooffin vendor-sdk artifact. The external-history contract was audited against `58ec5843077c8e060168911f0877d1220e41c05b`; that later commit fixes the installed runtime SDK marker to 0.6.10. No private core imports are used.
+`get-bb-plugin-sdk-0.6.11.tgz` is the public `@get-bb/plugin-sdk` package packed by the core thread from `aotd1/bb` external-history-api at `0a4c15ae2eab2ff5fcf05fc69e609bd6243ced90`, copied byte-for-byte from its `artifacts/get-bb-plugin-sdk-0.6.11.tgz`. External history and ensure checkout contracts were audited against that source commit. No private core imports are used.
 
 SHA-256:
 
 ```
-84ba07fc838b1eb66d15833bd148f29400e1265cb1cd31d927c057e56ed9504f
+6202184def479b559065deb98d4c42dd57d21ed77875ec9a0e04509b83f5f53d
 ```
 
 `package.json` pins the local tarball and `package-lock.json` pins its integrity. `npm ci` works without resolving this fork SDK from official npm. To reproduce a fresh pack, use the public package's prepack workflow (`npm pack` in `packages/plugin-sdk`) in a separate matching fork checkout. Do not build/modify the read-only core checkout used for this task. Tarball bytes can differ if packaging metadata changes; review its declarations/runtime and update provenance and checksum together.
 
-`bb plugin types --check` in BB 0.44.0 compares the dependency string with the numeric host version, so it warns about the `file:` pin even though both are SDK 0.6.10. Keep the reproducible local dependency. The package version, external SDK types, and built server/app metadata are checked separately. Do not run `bb plugin types` in write mode to replace this dependency with an unavailable npm release.
+The runtime floor is `>=0.6.11 <0.7`, with daemon protocol 225. Installed main remains SDK 0.6.10; do not install this plugin there or downgrade the floor. Build with the matching fork CLI (its already built `apps/cli/dist/index.js plugin build` can target this checkout without modifying core). Both generated server/app metadata must report SDK 0.6.11. Do not run `bb plugin types` in write mode to replace the dependency with an unavailable npm release.

@@ -6,6 +6,6 @@ Supported completed history includes messages, plans, reasoning, tools, commands
 
 Safe legacy adoption preserves existing thread/session identities without copying events. Ambiguous, mismatching or invalid legacy rows remain conflicts. There is no database repair/backup path.
 
-Continuation binds the original Codex session to a ready same-project environment without starting a model. If no environment exists, history remains passive and the report shows continuation pending; public core provisioning without a turn is currently unavailable. Explicit bind/release commands are provided. Existing archives and active user work are respected.
+Continuation binds the original Codex session to a ready same-project environment without starting a model. If no environment exists, public ensure prepares the recorded local project source with source ID/path CAS, without runtime, prompt or setup. Ensure/bind failures leave passive history and continuation pending. Explicit bind/release commands are provided. Existing archives and active user work are respected.
 
-Requires the BB 0.44.0 external-history fork with runtime SDK >=0.6.10, the vendored matching SDK, local read-only Codex source, Codex CLI and Git. See README for installation and limitations.
+Requires the BB 0.44.0 external-history fork with runtime SDK >=0.6.11 <0.7 and daemon protocol 225, the vendored matching SDK, local read-only Codex source, Codex CLI and Git. Installed main SDK 0.6.10 must be updated before installation/live calls. See README for installation and limitations.

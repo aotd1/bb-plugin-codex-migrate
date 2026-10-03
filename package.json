@@ -12,7 +12,7 @@
   },
   "engines": {
     "bb": ">=0.44 <0.45",
-    "bbPluginSdk": ">=0.6.10"
+    "bbPluginSdk": ">=0.6.11 <0.7"
   },
   "bb": {
     "name": "Codex Migrate",
@@ -32,7 +32,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@get-bb/plugin-sdk": "file:vendor-sdk/get-bb-plugin-sdk-0.6.10.tgz",
+    "@get-bb/plugin-sdk": "file:vendor-sdk/get-bb-plugin-sdk-0.6.11.tgz",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.0.0",
     "@types/react": "^19.0.0",

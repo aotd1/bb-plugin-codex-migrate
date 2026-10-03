@@ -267,7 +267,16 @@ export class ExternalHistoryStore {
       if (matches.length > 1) throw new Error(`Several ready environments match ${path}; choose one explicitly`);
       if (matches[0]) {environmentId=matches[0];break;}
     }
-    if (!environmentId) throw new Error("No ready environment on the source host; public SDK cannot provision one without starting a thread");
+    if (!environmentId) {
+      if (typeof this.bb.sdk.environments.experimental_ensureProjectCheckout !== "function") throw new Error("Ready checkout requires runtime Plugin SDK >=0.6.11; update BB before continuation");
+      const project = await this.bb.sdk.projects.get({projectId});
+      const sources = project.sources.filter(source => source.hostId === this.hostId && source.type === "local_path");
+      if (sources.length !== 1) throw new Error("Expected exactly one local project source on the source host; choose an environment explicitly");
+      const source = sources[0]!;
+      if (source.path !== projectRoot) throw new Error("Project source path changed; preview routing again before continuation");
+      const ready = await this.bb.sdk.environments.experimental_ensureProjectCheckout({projectId,hostId:this.hostId,expectedSourceId:source.id,expectedSourcePath:source.path});
+      environmentId = ready.environment.id;
+    }
     await this.bb.sdk.threads.experimental_bindExternalSession({threadId, expectedGeneration:binding.generation,expectedSessionId:binding.sessionId,providerId:"codex",providerThreadId:sessionId,environmentId});
   }
 }

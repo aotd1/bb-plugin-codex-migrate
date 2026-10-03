@@ -59,8 +59,8 @@ export function fixture(options={}) {
   const {bb,harness}=createFakePluginHost({pluginId:'codex-migrate',sdk:{
     threads,
     system:{config:async()=>({primaryHostId:'host_source'})},
-    projects:{list:async()=>options.projects??[],create:async q=>({id:'proj_import',name:q.name,sources:[{hostId:q.source.hostId,path:q.source.path,isDefault:true}]}),attachments:{upload:async q=>({type:'localImage',path:`attachments/upload-${options.uploads?.push(q)??1}.png`}),read:async()=>({bytes:options.attachmentBytes??new Uint8Array(),mimeType:'image/png',sizeBytes:0})}},
-    environments:{list:async()=>options.noEnvironment?[]:[{id:'env_ready',projectId:'proj_import',hostId:'host_source',path:meta.cwd,status:'ready',lifecycle:{phase:'active',teardown:null}}],get:async q=>({id:q.environmentId,projectId:'proj_import',hostId:'host_source',status:'ready',lifecycle:{phase:'active',teardown:null}})},
+    projects:{get:async q=>({id:q.projectId,sources:options.sources??[{id:'src_local',type:'local_path',hostId:'host_source',path:meta.cwd}]}),list:async()=>options.projects??[],create:async q=>({id:'proj_import',name:q.name,sources:[{hostId:q.source.hostId,path:q.source.path,isDefault:true}]}),attachments:{upload:async q=>({type:'localImage',path:`attachments/upload-${options.uploads?.push(q)??1}.png`}),read:async()=>({bytes:options.attachmentBytes??new Uint8Array(),mimeType:'image/png',sizeBytes:0})}},
+    environments:{experimental_ensureProjectCheckout:async q=>{if(options.ensureConflict)throw Error(options.ensureConflict);return {environment:{id:'env_ensured',projectId:q.projectId,hostId:q.hostId,path:q.expectedSourcePath,status:'ready',lifecycle:{phase:'active',teardown:null}},created:true};},list:async()=>options.noEnvironment?[]:[{id:'env_ready',projectId:'proj_import',hostId:'host_source',path:meta.cwd,status:'ready',lifecycle:{phase:'active',teardown:null}}],get:async q=>({id:q.environmentId,projectId:'proj_import',hostId:'host_source',status:'ready',lifecycle:{phase:'active',teardown:null}})},
   }});
   return {bb,harness,bindings,entries,timeline,archives,calls};
 }

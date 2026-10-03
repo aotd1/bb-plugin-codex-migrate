@@ -4,11 +4,11 @@ Preview and import explicitly selected local Codex folders and conversations thr
 
 ## Requirements and local installation
 
-This development branch requires BB 0.44.0 from `aotd1/bb` external-history-api, audited at commit `58ec5843077c8e060168911f0877d1220e41c05b`, with **runtime Plugin SDK >=0.6.10**. Vanilla BB with SDK 0.5.29 cannot run this version. SDK 0.6.10 of this fork is not published to npm: the dependency is pinned to the checked-in public package [vendor-sdk](vendor-sdk/README.md), with checksum and provenance. Do not replace it with npm `latest`, a private core import or a lower SDK floor.
+This development branch requires BB 0.44.0 from `aotd1/bb` external-history-api, audited at commit `0a4c15ae2eab2ff5fcf05fc69e609bd6243ced90`, with **runtime Plugin SDK >=0.6.11 <0.7 and daemon protocol 225**. Vanilla BB with SDK 0.5.29 cannot run this version. SDK 0.6.11 of this fork is not published to npm: the dependency is pinned to the checked-in public package [vendor-sdk](vendor-sdk/README.md), with checksum and provenance. Do not replace it with npm `latest`, a private core import or a lower SDK floor.
 
 The BB server must run on the machine containing the selected Codex source, with its primary host identifying that machine. The importer reads `CODEX_HOME/state_5.sqlite` (or `~/.codex/state_5.sqlite`), projections and rollouts read-only. Install Git and a Codex CLI supporting `codex app-server`; use `CODEX_CLI` for an explicit executable path. A registered **Codex provider** and a ready same-project environment on the source host are required for interactive continuation, separately from reading Codex source history.
 
-This branch has not been released or published. Build the dedicated checkout:
+This branch has not been released or published. **The currently installed main application remains on SDK 0.6.10 and cannot load this branch.** Update the main server/daemon to the matching fork before installation or live ensure calls. No application update or real migration was performed here. Build the dedicated checkout using a matching SDK 0.6.11 BB CLI:
 
 ```sh
 cd /Users/aotd/Documents/Projects/bb-plugin-codex-migrate-api
@@ -55,7 +55,9 @@ New archived conversations import as passive history and are then archived throu
 
 For unarchived conversations, the importer separately binds the original Codex resume handle to an unambiguous ready environment on the source host. Bind uses generation/session CAS and starts no runtime; a subsequent ordinary user send resumes that handle. Existing adopted interactive bindings keep their environment and provider/session identity. Exact BB-owned source turns are acknowledged with existing sequences rather than copied; ambiguous or mismatching reconciliation conflicts.
 
-**Current core gap:** public SDK has no standalone provisioning operation that creates a ready project checkout without a thread send/spawn. For a new project with no ready environment, history is saved passively and the report says `Codex continuation pending`. Core confirmed this gap in thread `thr_sbs4wm9872`. Once a suitable ready environment exists, the explicit `bind` command enables continuation. `release` requests a settled idle release; failures/retained active turns remain bound. Unarchive explicitly before bind/release if needed. Archived Codex sessions may also need to be unarchived in Codex before later continuation.
+If no suitable ready environment exists, `experimental_ensureProjectCheckout` prepares the recorded `local_path` project source on the source host. The adapter reads `projects.get().sources`, requires exactly one matching host source and verifies its path against routing, then sends all four source CAS fields. It never provisions an arbitrary source cwd/worktree. Ensure performs read-only directory/Git inspection and atomically creates or reuses a shared unmanaged checkout; no prompt, runtime, setup hook, clone, worktree or branch change occurs. It is not a reservation: bind independently validates ownership/readiness. Source changes, inspection errors, lifecycle/ownership conflicts or missing API leave history saved with `Codex continuation pending`; rerun the same selection after resolving the cause. Existing interactive bindings keep their environment and skip ensure.
+
+`release` requests a settled idle release; failures/retained active turns remain bound. Unarchive explicitly before bind/release if needed. Archived Codex sessions may also need to be unarchived in Codex before later continuation.
 
 ## Legacy imports and content boundaries
 
