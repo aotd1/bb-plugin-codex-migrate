@@ -25,7 +25,7 @@ function fixture(withAttachment) {
     model: "gpt-6", reasoningEffort: "medium", source: "vscode",
   };
   const history = {
-    userMessages: 1, assistantMessages: 0, images: 1,
+    userMessages: 1, assistantMessages: 0, images: 1, lastActivityAt: 110,
     events: [
       { id: "evt_1", sequence: 1, scopeKind: "thread", turnId: null, providerThreadId: "codex_thread", type: "thread/identity", itemId: null, itemKind: null, data: JSON.stringify({ providerThreadId: "codex_thread" }), createdAt: 100 },
       { id: "evt_2", sequence: 2, scopeKind: "thread", turnId: null, providerThreadId: null, type: "client/turn/requested", itemId: null, itemKind: null, data: JSON.stringify({ input: [{ type: "localImage", path: "image.png" }] }), createdAt: 110 },
@@ -42,6 +42,7 @@ test("import preserves identity, archive state, attachment ownership and idempot
     const threadId = store.importThread(args);
     assert.deepEqual(store.existing(source.id), { threadId, projectId: "proj_test", archived: true, userMessages: 1, assistantMessages: 0 });
     assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM project_attachment_threads WHERE thread_id=?").get(threadId).n, 1);
+    assert.deepEqual({ ...store.db.prepare("SELECT latest_attention_at AS attention, updated_at AS updated FROM threads WHERE id=?").get(threadId) }, { attention: 110, updated: 110 });
     assert.throws(() => store.importThread(args), /already imported/);
     assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM threads").get().n, 1);
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
@@ -124,5 +125,19 @@ test("repair fills an empty imported title when Codex has a chat name", () => {
     assert.deepEqual(store.repairImportedThread(source, "truncate", 80), { events: 0, title: true });
     assert.equal(store.db.prepare("SELECT title FROM threads WHERE id=?").get(threadId).title, source.title);
     assert.equal(store.db.prepare("SELECT text FROM thread_search_segments WHERE thread_id=? AND source_kind='title'").get(threadId).text, source.title);
+  } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("repair turns Codex directives in imported messages into Markdown", () => {
+  const { directory, source, history } = fixture(true);
+  const store = new BbStore(directory, true);
+  try {
+    const threadId = store.importThread({ projectId: "proj_test", hostId: "host_test", projectRoot: directory, source, history });
+    const data = JSON.stringify({ item: { type: "agentMessage", id: "m1", text: ':codex-file-citation{path="/tmp/report.xlsx" purpose="output"}' } });
+    store.db.prepare("INSERT INTO events(id,thread_id,environment_id,scope_kind,turn_id,provider_thread_id,sequence,type,item_id,item_kind,data,created_at) VALUES('evt_m1',?,NULL,'turn','t1','codex_thread',9,'item/completed','m1','agentMessage',?,120)").run(threadId, data);
+    store.db.prepare("INSERT INTO thread_search_segments VALUES(?,?,'assistant_message','event:9',9,'raw',120,120)").run(`${threadId}:assistant_message:event:9`, threadId);
+    assert.equal(store.repairImportedThread({ ...source, fallbackTitle: source.title }, "original", 80).events, 1);
+    assert.equal(JSON.parse(store.db.prepare("SELECT data FROM events WHERE id='evt_m1'").get().data).item.text, "📊 [report.xlsx](</tmp/report.xlsx>)");
+    assert.equal(store.db.prepare("SELECT text FROM thread_search_segments WHERE source_key='event:9'").get().text, "📊 [report.xlsx](</tmp/report.xlsx>)");
   } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
 });

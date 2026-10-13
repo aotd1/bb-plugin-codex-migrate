@@ -60,16 +60,15 @@ test("explicit project selection creates a new BB project; omission imports noth
     const unselectedRepair = await harness.behavior.runCli(["repair", "--json"]);
     assert.equal(unselectedRepair.exitCode, 1);
     assert.match(unselectedRepair.stderr, /Select a project or folder explicitly/);
-    const skipped = await harness.behavior.runCli(["apply", "--project", "Fixture Project", "--json"]);
-    assert.equal(skipped.exitCode, 1);
-    assert.match(skipped.stderr, /No importable folders/);
-    assert.equal(created.length, 0);
+    const plain = await harness.behavior.runCli(["apply", "--project", "Fixture Project", "--json"]);
+    assert.equal(plain.exitCode, 0);
+    assert.equal(created.length, 1);
     assert.equal(existsSync(join(root, ".git")), false);
     const selected = await harness.behavior.runCli(["apply", "--project", "Fixture Project", "--init-git", "--json"]);
     assert.equal(selected.exitCode, 0);
     assert.equal(existsSync(join(root, ".git")), true);
-    assert.equal(created.length, 1);
-    assert.equal(created[0].name, "Fixture Project");
+    assert.equal(created.length, 2);
+    assert.equal(created[1].name, "Fixture Project");
     assert.equal(JSON.parse(selected.stdout).projects[0].targetProjectId, "proj_fixture");
     const beforeReload = await harness.behavior.callRpc("status", null);
     assert.equal(beforeReload.current.state, "completed");
@@ -565,6 +564,134 @@ test("background migration keeps a readable status after the caller leaves", asy
     releaseCreate();
     if (prior === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = prior;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a plain subfolder chat keeps one destination, and git init cannot absorb a selected folder", async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "bb-codex-plain-")));
+  const codexHome = join(directory, "codex");
+  const bbHome = join(directory, "bb");
+  const plain = join(directory, "plain");
+  const sub = join(plain, "sub");
+  const { mkdirSync } = await import("node:fs");
+  for (const path of [codexHome, bbHome, plain, sub]) mkdirSync(path);
+  const source = new Database(join(codexHome, "state_5.sqlite"));
+  source.exec(`
+    CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,position INTEGER NOT NULL,created_at_ms INTEGER NOT NULL);
+    CREATE TABLE project_roots(project_id TEXT NOT NULL,position INTEGER NOT NULL,path TEXT NOT NULL);
+    CREATE TABLE threads(id TEXT PRIMARY KEY,project_id TEXT,title TEXT,name TEXT,cwd TEXT,archived INTEGER,archived_at INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER,created_at INTEGER,updated_at INTEGER,model TEXT,reasoning_effort TEXT,source TEXT);
+  `);
+  source.prepare("INSERT INTO projects VALUES(?,?,?,?)").run("src_plain", "Plain", 0, 100);
+  source.prepare("INSERT INTO projects VALUES(?,?,?,?)").run("src_sub", "Sub", 1, 100);
+  source.prepare("INSERT INTO project_roots VALUES(?,?,?)").run("src_plain", 0, plain);
+  source.prepare("INSERT INTO project_roots VALUES(?,?,?)").run("src_sub", 0, sub);
+  source.prepare("INSERT INTO threads VALUES(?,?,?,NULL,?,0,NULL,1000,2000,1,2,NULL,NULL,'vscode')").run("chat", "src_plain", "Chat", sub);
+  const loose = join(directory, "loose-repo");
+  mkdirSync(loose);
+  execFileSync("git", ["-C", loose, "init"], { stdio: "ignore" });
+  source.prepare("INSERT INTO threads VALUES(?,?,?,NULL,?,0,NULL,1000,2000,1,2,NULL,NULL,'vscode')").run("loose", null, "Loose", loose);
+  source.close();
+  writeFileSync(join(codexHome, ".codex-global-state.json"), JSON.stringify({ "projectless-thread-ids": ["loose"] }));
+  const target = new Database(join(bbHome, "bb.db"));
+  target.exec(`
+    CREATE TABLE threads(id TEXT,project_id TEXT,environment_id TEXT,provider_id TEXT,status TEXT,archived_at INTEGER,created_at INTEGER,updated_at INTEGER,deleted_at INTEGER);
+    CREATE TABLE environments(id TEXT,project_id TEXT,host_id TEXT,path TEXT,status TEXT,environment_provider_id TEXT,environment_provider_selection TEXT);
+    CREATE TABLE events(id TEXT,thread_id TEXT,environment_id TEXT,scope_kind TEXT,turn_id TEXT,provider_thread_id TEXT,sequence INTEGER,type TEXT,item_kind TEXT,data TEXT,created_at INTEGER);
+    CREATE TABLE thread_search_segments(id TEXT,thread_id TEXT,source_kind TEXT,source_key TEXT,source_seq INTEGER,text TEXT,created_at INTEGER,updated_at INTEGER);
+  `);
+  target.prepare("INSERT INTO threads VALUES('thr_1','proj_plain','env_1','codex','idle',NULL,1,2,NULL)").run();
+  target.prepare("INSERT INTO events VALUES('evt_1','thr_1','env_1','thread',NULL,'chat',1,'thread/identity',NULL,'{}',1)").run();
+  target.close();
+  const prior = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "codex-migrate",
+    dataDir: bbHome,
+    sdk: {
+      system: { config: async () => ({ primaryHostId: "host_test" }) },
+      projects: { list: async () => [{ id: "proj_plain", name: "Plain", sources: [{ id: "source_plain", hostId: "host_test", path: plain, isDefault: true }] }] },
+    },
+  });
+  try {
+    await plugin(bb);
+    const preview = await harness.behavior.callRpc("scan", { projects: ["Plain"], all: false, includeThreads: true });
+    assert.deepEqual(preview.projects[0].conflicts, []);
+    const chats = await harness.behavior.callRpc("scan", { projects: ["Codex chats"], all: false, includeThreads: true });
+    assert.deepEqual(chats.projects[0].conflicts, []);
+    assert.deepEqual(chats.projects[0].threads.map((thread) => thread.id), ["loose"]);
+    for (const gitInitRoots of [[plain], [sub]]) {
+      await assert.rejects(
+        harness.behavior.callRpc("apply", { projects: [], roots: [plain, sub], gitInitRoots, all: false, existingOnly: false, limit: null }),
+        /would change which project owns chats/,
+      );
+    }
+    assert.equal(existsSync(join(plain, ".git")), false);
+    assert.equal(existsSync(join(sub, ".git")), false);
+    await harness.lifecycle.dispose();
+  } finally {
+    if (prior === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prior;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a fallback chat keeps its exemption when its folder merges with a registered project", async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), "bb-codex-merge-")));
+  const priorHome = process.env.HOME;
+  process.env.HOME = directory;
+  const codexHome = join(directory, "codex");
+  const bbHome = join(directory, "bb");
+  const docs = join(directory, "Documents", "Codex");
+  const loose = join(directory, "loose-repo");
+  const { mkdirSync } = await import("node:fs");
+  for (const path of [codexHome, bbHome, docs, loose]) mkdirSync(path, { recursive: true });
+  execFileSync("git", ["-C", loose, "init"], { stdio: "ignore" });
+  const source = new Database(join(codexHome, "state_5.sqlite"));
+  source.exec(`
+    CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,position INTEGER NOT NULL,created_at_ms INTEGER NOT NULL);
+    CREATE TABLE project_roots(project_id TEXT NOT NULL,position INTEGER NOT NULL,path TEXT NOT NULL);
+    CREATE TABLE threads(id TEXT PRIMARY KEY,project_id TEXT,title TEXT,name TEXT,cwd TEXT,archived INTEGER,archived_at INTEGER,created_at_ms INTEGER,updated_at_ms INTEGER,created_at INTEGER,updated_at INTEGER,model TEXT,reasoning_effort TEXT,source TEXT);
+  `);
+  source.prepare("INSERT INTO projects VALUES(?,?,?,?)").run("src_docs", "Docs", 0, 100);
+  source.prepare("INSERT INTO project_roots VALUES(?,?,?)").run("src_docs", 0, docs);
+  source.prepare("INSERT INTO threads VALUES(?,?,?,NULL,?,0,NULL,1000,2000,1,2,NULL,NULL,'vscode')").run("loose", null, "Loose", loose);
+  source.prepare("INSERT INTO threads VALUES(?,?,?,NULL,?,0,NULL,1000,2000,1,2,NULL,NULL,'vscode')").run("docchat", "src_docs", "Doc chat", docs);
+  source.close();
+  writeFileSync(join(codexHome, ".codex-global-state.json"), JSON.stringify({ "projectless-thread-ids": ["loose"] }));
+  const target = new Database(join(bbHome, "bb.db"));
+  target.exec(`
+    CREATE TABLE threads(id TEXT,project_id TEXT,environment_id TEXT,provider_id TEXT,status TEXT,archived_at INTEGER,created_at INTEGER,updated_at INTEGER,deleted_at INTEGER);
+    CREATE TABLE environments(id TEXT,project_id TEXT,host_id TEXT,path TEXT,status TEXT,environment_provider_id TEXT,environment_provider_selection TEXT);
+    CREATE TABLE events(id TEXT,thread_id TEXT,environment_id TEXT,scope_kind TEXT,turn_id TEXT,provider_thread_id TEXT,sequence INTEGER,type TEXT,item_kind TEXT,data TEXT,created_at INTEGER);
+    CREATE TABLE thread_search_segments(id TEXT,thread_id TEXT,source_kind TEXT,source_key TEXT,source_seq INTEGER,text TEXT,created_at INTEGER,updated_at INTEGER);
+  `);
+  target.prepare("INSERT INTO threads VALUES('thr_loose','proj_docs','env_1','codex','idle',NULL,1,2,NULL)").run();
+  target.prepare("INSERT INTO events VALUES('evt_1','thr_loose','env_1','thread',NULL,'loose',1,'thread/identity',NULL,'{}',1)").run();
+  target.prepare("INSERT INTO threads VALUES('thr_doc','proj_docs','env_1','codex','idle',NULL,1,2,NULL)").run();
+  target.prepare("INSERT INTO events VALUES('evt_2','thr_doc','env_1','thread',NULL,'docchat',1,'thread/identity',NULL,'{}',1)").run();
+  target.close();
+  const prior = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = codexHome;
+  const { bb, harness } = createFakePluginHost({
+    pluginId: "codex-migrate",
+    dataDir: bbHome,
+    sdk: {
+      system: { config: async () => ({ primaryHostId: "host_test" }) },
+      projects: { list: async () => [{ id: "proj_docs", name: "Docs", sources: [{ id: "source_docs", hostId: "host_test", path: docs, isDefault: true }] }] },
+    },
+  });
+  try {
+    await plugin(bb);
+    const preview = await harness.behavior.callRpc("scan", { projects: [], roots: [docs], all: false, includeThreads: false });
+    assert.deepEqual(preview.projects.map((project) => project.rootDetails[0].candidates), [2, 2]);
+    const report = await harness.behavior.callRpc("apply", { projects: [], roots: [docs], all: false, existingOnly: false, limit: null });
+    assert.equal(report.projects.reduce((sum, project) => sum + project.existing, 0), 2);
+    await harness.lifecycle.dispose();
+  } finally {
+    if (prior === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = prior;
+    process.env.HOME = priorHome;
     rmSync(directory, { recursive: true, force: true });
   }
 });
